@@ -1,0 +1,382 @@
+//! Tests for tables: the schema and its indexes, filtered and ordered queries, checked writes, the catalog across a reopen, dropping a table, and the refusals.
+import Foundation
+import KiraDB
+
+// Tables: the schema and its indexes, filtered and ordered queries, writes
+// that are checked against keys, uniqueness and types, the catalog across a
+// reopen, dropping a table, and the schema and query refusals.
+
+/// A people table: id is the key, email is unique and optional, age is indexed.
+function peopleSchema() -> TableSchema {
+    return TableSchema {
+        name: "people",
+        columns: [Column { name: "id", type: .Number }, Column {
+            name: "name",
+            type: .Text
+        }, Column { name: "email", type: .Text, optional: true }, Column {
+            name: "age",
+            type: .Number
+        }],
+        primaryKey: ["id"],
+        indexes: [IndexSchema { name: "byEmail", columns: ["email"], unique: true }, IndexSchema {
+            name: "byAge",
+            columns: ["age"]
+        }]
+    }
+}
+
+/// One person's row, with an email made from their name.
+function personRow(id: Number, name: String, age: Number) -> Document {
+    var row = Document()
+    row.set("id", .Number(id))
+    row.set("name", .Text(copy name))
+    row.set("email", .Text(name + "@kira.dev"))
+    row.set("age", .Number(age))
+    return row
+}
+
+/// The rows' names in brackets, space separated, or why the read failed.
+function rowNames(read: borrow Result<[Document], TableFailure>) -> String {
+    return match read {
+        Ok(rows) -> {
+            var text = ""
+            for row in rows {
+                if text.count > 0 { text = text + " " }
+                text = text + match row.textField("name") {
+                    Some(name) -> name
+                    None -> "?"
+                }
+            }
+            "[" + text + "]"
+        }
+        Error(failure) -> traceText(failure)
+    }
+}
+
+/// Each row's fields as `name=value`, in their order.
+function rowFields(read: borrow Result<[Document], TableFailure>) -> String {
+    return match read {
+        Ok(rows) -> {
+            var text = ""
+            for row in rows {
+                for (name, value) in row.fields { text = text + "\(name)=\(traceText(value)) " }
+            }
+            text
+        }
+        Error(failure) -> traceText(failure)
+    }
+}
+
+/// `ok`, or why a write failed.
+function writeOutcome(written: borrow Result<Void, TableFailure>) -> String {
+    return match written {
+        Ok -> "ok"
+        Error(failure) -> traceText(failure)
+    }
+}
+
+/// A fresh database holding the people table and four rows.
+function seededPeople(name: borrow String) -> Result<(Database, Table), String> {
+    let path = match emptyDirectory(name) {
+        Ok(found) -> found
+        Error(failure) -> return .Error(traceText(failure))
+    }
+    var open = match openDatabase(path) {
+        Ok(database) -> database
+        Error(failure) -> return .Error(traceText(failure))
+    }
+    var people = Table { schema: peopleSchema(), id: 0, indexIds: [] }
+    match open.createTable(peopleSchema()) {
+        Ok(created) -> people = created
+        Error(failure) -> return .Error(traceText(failure))
+    }
+    for row in [personRow(3, "grace", 85), personRow(1, "ada", 36), personRow(
+        2,
+        "alan",
+        41
+    ), personRow(4, "linus", 36)] {
+        match open.insert(people, row) {
+            Ok -> {}
+            Error(failure) -> return .Error(traceText(failure))
+        }
+    }
+    return .Ok((move open, move people))
+}
+
+/// Filters match on a column, orders sort, and a limit keeps the first rows.
+@Test
+function queriesFilterOrderAndLimit() {
+    let (database, people) = match seededPeople("tables-queries") {
+        Ok(pair) -> pair
+        Error(text) -> {
+            expect!((text) == "")
+            return
+        }
+    }
+    expect!((rowNames(database.select(people.query()))) == "[ada alan grace linus]")
+    expect!(
+        (
+            rowNames(
+                database.select(
+                    people.query().filter(column("email").equals(.Text("alan@kira.dev")))
+                )
+            )
+        ) == "[alan]"
+    )
+    expect!(
+        (
+            rowNames(database.select(people.query().ordered(column("age").descending()).limited(2)))
+        ) == "[grace alan]"
+    )
+    expect!(
+        (
+            rowNames(database.select(people.query().filter(column("age").equals(.Number(36)))))
+        ) == "[ada linus]"
+    )
+}
+
+/// Several filters combine, and an any-of filter keeps rows that meet either.
+@Test
+function queriesCombineFilters() {
+    let (database, people) = match seededPeople("tables-combine") {
+        Ok(pair) -> pair
+        Error(text) -> {
+            expect!((text) == "")
+            return
+        }
+    }
+    expect!(
+        (
+            rowNames(
+                database.select(
+                    people.query().filter(column("id").greaterThan(.Number(1))).filter(
+                        column("id").atMost(.Number(3))
+                    )
+                )
+            )
+        ) == "[alan grace]"
+    )
+    expect!(
+        (
+            rowNames(
+                database.select(
+                    people.query().filter(
+                        .AnyOf(
+                            [column("name").equals(.Text("ada")), column("age").atLeast(
+                                .Number(80)
+                            )]
+                        )
+                    )
+                )
+            )
+        ) == "[ada grace]"
+    )
+}
+
+/// A write that repeats a key, a unique value or the wrong type is refused and
+/// writes nothing; an update may not change the key; a missing row is reported.
+@Test
+function writesAreChecked() {
+    let (database, people) = match seededPeople("tables-writes") {
+        Ok(pair) -> pair
+        Error(text) -> {
+            expect!((text) == "")
+            return
+        }
+    }
+    var open = database
+    expect!(
+        (
+            writeOutcome(open.insert(people, personRow(1, "other", 20)))
+        ) == "TableFailure.DuplicateKey"
+    )
+    expect!(
+        (
+            writeOutcome(open.insert(people, personRow(9, "ada", 20)))
+        ) == "TableFailure.NotUnique(\"byEmail\")"
+    )
+    var wrongType = personRow(9, "x", 20)
+    wrongType.set("age", .Text("old"))
+    expect!(
+        (
+            writeOutcome(open.insert(people, wrongType))
+        ) == "TableFailure.Row(RowProblem.WrongType(\"age\"))"
+    )
+    var changes = Document()
+    changes.set("age", .Number(37))
+    expect!((writeOutcome(open.update(people, [.Number(1)], changes))) == "ok")
+    var newKey = Document()
+    newKey.set("id", .Number(7))
+    expect!(
+        (
+            writeOutcome(open.update(people, [.Number(1)], newKey))
+        ) == "TableFailure.Row(RowProblem.KeyChanged(\"id\"))"
+    )
+    expect!((writeOutcome(open.update(people, [.Number(99)], changes))) == "TableFailure.NoSuchRow")
+    expect!((writeOutcome(open.delete(people, [.Number(2)]))) == "ok")
+    expect!(
+        (rowNames(open.select(people.query().filter(column("age").equals(.Number(37)))))) == "[ada]"
+    )
+    expect!(
+        (
+            rowNames(
+                open.select(people.query().filter(column("email").equals(.Text("alan@kira.dev"))))
+            )
+        ) == "[]"
+    )
+}
+
+/// A table created twice is refused, and after a reopen its rows and its
+/// id and index count are still there.
+@Test
+function catalogSurvivesAReopen() {
+    let (database, people) = match seededPeople("tables-catalog") {
+        Ok(pair) -> pair
+        Error(text) -> {
+            expect!((text) == "")
+            return
+        }
+    }
+    var open = database
+    let again = match open.createTable(peopleSchema()) {
+        Ok(_) -> "created twice"
+        Error(failure) -> traceText(failure)
+    }
+    expect!((again) == "TableFailure.TableExists(\"people\")")
+    match open.close() {
+        Ok -> {}
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    let path = StoreTest.root + "/tables-catalog"
+    let reopened = match openDatabase(path) {
+        Ok(database) -> database
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    let table = match reopened.table("people") {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expect!(
+        (
+            rowNames(reopened.select(table.query().filter(column("age").equals(.Number(36)))))
+        ) == "[ada linus]"
+    )
+    expect!((table.id) == (1))
+    expect!((table.indexIds.count) == (2))
+}
+
+/// A dropped table is gone, and a table of the same name starts empty.
+@Test
+function droppedTableIsGoneAndRecreatedEmpty() {
+    let (database, people) = match seededPeople("tables-drop") {
+        Ok(pair) -> pair
+        Error(text) -> {
+            expect!((text) == "")
+            return
+        }
+    }
+    var open = database
+    expect!((writeOutcome(open.dropTable(people))) == "ok")
+    let lookup = match open.table("people") {
+        Ok(_) -> "still there"
+        Error(failure) -> traceText(failure)
+    }
+    expect!((lookup) == "TableFailure.NoSuchTable(\"people\")")
+    let recreated = match open.createTable(peopleSchema()) {
+        Ok(table) -> {
+            expect!((table.id) == (4))
+            rowNames(open.select(table.query()))
+        }
+        Error(failure) -> traceText(failure)
+    }
+    expect!((recreated) == "[]")
+}
+
+/// A table with no key, a filter against the wrong type, and an order by a
+/// column that does not exist are each refused with their reason.
+@Test
+function schemaAndQueryProblemsAreRefused() {
+    let (database, people) = match seededPeople("tables-checks") {
+        Ok(pair) -> pair
+        Error(text) -> {
+            expect!((text) == "")
+            return
+        }
+    }
+    var open = database
+    let noKey = match open.createTable(
+        TableSchema { name: "t", columns: [Column { name: "a", type: .Number }], primaryKey: [] }
+    ) {
+        Ok(_) -> "created"
+        Error(failure) -> traceText(failure)
+    }
+    expect!((noKey) == "TableFailure.Schema(SchemaProblem.NoPrimaryKey)")
+    expect!(
+        (
+            rowNames(open.select(people.query().filter(column("age").equals(.Text("x")))))
+        ) == "TableFailure.Query(QueryProblem.WrongType(\"age\"))"
+    )
+    expect!(
+        (
+            rowNames(open.select(people.query().ordered(column("height").ascending())))
+        ) == "TableFailure.Query(QueryProblem.UnknownColumn(\"height\"))"
+    )
+}
+
+/// Nulls are allowed in an optional column, replacing keeps a row's key, and
+/// projections, empty filters and combined orders give what they say.
+@Test
+function nullsReplacementsAndProjectionsBehave() {
+    let (database, people) = match seededPeople("tables-more") {
+        Ok(pair) -> pair
+        Error(text) -> {
+            expect!((text) == "")
+            return
+        }
+    }
+    var open = database
+    var noEmail = personRow(5, "ken", 50)
+    noEmail.set("email", .Null)
+    var alsoNoEmail = personRow(6, "dennis", 50)
+    alsoNoEmail.fields = [("id", .Number(6)), ("name", .Text("dennis")), ("age", .Number(50))]
+    expect!((writeOutcome(open.insert(people, noEmail))) == "ok")
+    expect!((writeOutcome(open.insert(people, alsoNoEmail))) == "ok")
+    expect!((writeOutcome(open.replace(people, personRow(1, "ada", 37)))) == "ok")
+    expect!((writeOutcome(open.replace(people, personRow(7, "barbara", 60)))) == "ok")
+    expect!(
+        (rowNames(open.select(people.query().filter(column("email").isNull())))) == "[ken dennis]"
+    )
+    expect!(
+        (
+            rowFields(
+                open.select(
+                    people.query().filter(column("id").equals(.Number(1))).selecting(
+                        ["age", "name"]
+                    )
+                )
+            )
+        ) == "age=Value.Number(37) name=Value.Text(\"ada\") "
+    )
+    expect!((rowNames(open.select(people.query().filter(.AllOf([])).limited(1)))) == "[ada]")
+    expect!((rowNames(open.select(people.query().filter(.AnyOf([]))))) == "[]")
+    expect!(
+        (
+            rowNames(
+                open.select(
+                    people.query().filter(column("age").atLeast(.Number(50))).ordered(
+                        column("name").ascending()
+                    )
+                )
+            )
+        ) == "[barbara dennis grace ken]"
+    )
+}

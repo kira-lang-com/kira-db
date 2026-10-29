@@ -1,0 +1,171 @@
+//! Compaction: merging sorted tables down the levels so reads stay cheap.
+//!
+//! Level 0 holds the tables written from memory. When it holds too many, or a deeper
+//! level grows past its size, a level's tables are merged with the overlapping
+//! tables one level down. Each level holds ten times the bytes of the one above.
+//! The rule is SPEC section 5.7.
+import Foundation
+
+/// SPEC section 5.7: level `n` holds `Tuning.levelBytes * 10^(n-1)` bytes.
+namespace Levels {
+    /// How many times more bytes each level holds than the one above it.
+    let growth: UNumber = 10
+}
+
+/// Leveled compaction (SPEC section 5.7).
+extend Store {
+    /// Compacts until no level is past its limit.
+    function compactWhileNeeded(borrow mut self) -> Result<Void, StorageFailure> {
+        while true {
+            match crowdedLevel() {
+                Some(level) -> try compact(level)
+                None -> break
+            }
+        }
+        return .Ok
+    }
+
+    /// The shallowest level past its limit, if one is.
+    function crowdedLevel(borrow self) -> UNumber? {
+        if tablesAt(0) >= Tuning.levelZeroTables { return .Some(0) }
+        var limit = Tuning.levelBytes
+        for level in 1..deepestLevel() + 1 {
+            if bytesAt(level) > limit { return .Some(level) }
+            limit *= Levels.growth
+        }
+        return .None
+    }
+
+    /// Merges level 0 whole, or a deeper level's oldest table, with the tables
+    /// it overlaps one level down, into new tables there.
+    function compact(borrow mut self, level: UNumber) -> Result<Void, StorageFailure> {
+        let inputs = compactionInputs(level)
+        var sources: [[Entry]] = []
+        for index in inputs {
+            let entries = try tables[index].table.entries()
+            sources.append(entries)
+        }
+        let target = level + 1
+        let merged = mergedEntries(sources)
+        // The oldest open snapshot is the newest write: none older is held.
+        let deletes: Deletes = deepestLevel() <= target ? .Drop : .Keep
+        let kept = retainedVersions(merged, manifest.lastSequence, move deletes)
+        var outputs: [LiveTable] = []
+        for chunk in tableChunks(kept) {
+            let live = try writeLiveTable(chunk, target)
+            outputs.append(live)
+        }
+        return install(inputs, move outputs)
+    }
+
+    /// The positions in `tables` of a compaction's inputs at `level`, and of
+    /// the tables one level down that their keys overlap.
+    function compactionInputs(borrow self, level: UNumber) -> [UNumber] {
+        var chosen: [UNumber] = []
+        if level == 0 {
+            for (index, live) in tables.enumerated() {
+                if live.record.level == 0 { chosen.append(index) }
+            }
+        } else {
+            match oldestAt(level) {
+                Some(index) -> chosen.append(index)
+                // A crowded level holds tables; an empty one has none to merge.
+                None -> return chosen
+            }
+        }
+        if chosen.count == 0 { return chosen }
+        var smallest = copy tables[chosen[0]].record.smallest
+        var largest = copy tables[chosen[0]].record.largest
+        for index in chosen {
+            let record = tables[index].record
+            if compareKeys(record.smallest, smallest) == .Less { smallest = copy record.smallest }
+            if compareKeys(record.largest, largest) == .Greater { largest = copy record.largest }
+        }
+        for (index, live) in tables.enumerated() {
+            if live.record.level == level + 1 && live.record.overlaps(smallest, largest) {
+                chosen.append(index)
+            }
+        }
+        return chosen
+    }
+
+    /// Replaces the tables at `inputs` with `outputs`: the manifest first, so
+    /// a crash leaves one set or the other whole, then the inputs' files.
+    function install(
+        borrow mut self,
+        inputs: borrow [UNumber],
+        outputs: [LiveTable]
+    ) -> Result<Void, StorageFailure> {
+        var remaining: [LiveTable] = []
+        var retired: [LiveTable] = []
+        for (index, live) in tables.enumerated() {
+            if inputs.contains(index) { retired.append(copy live) } else {
+                remaining.append(copy live)
+            }
+        }
+        remaining.appendAll(outputs)
+        manifest.tables = []
+        for live in remaining { manifest.tables.append(copy live.record) }
+        try storeManifest(directory, manifest)
+        tables = byRecency(move remaining)
+        for live in retired {
+            try live.table.close()
+            try removePath(tablePath(directory, live.record.number))
+        }
+        return .Ok
+    }
+
+    /// Returns the number of tables at `level`.
+    function tablesAt(borrow self, level: UNumber) -> UNumber {
+        var count: UNumber = 0
+        for live in tables {
+            if live.record.level == level { count += 1 }
+        }
+        return count
+    }
+
+    /// Returns the total size of the tables at `level`, in bytes.
+    function bytesAt(borrow self, level: UNumber) -> UNumber {
+        var bytes: UNumber = 0
+        for live in tables {
+            if live.record.level == level { bytes += live.size }
+        }
+        return bytes
+    }
+
+    /// Returns the deepest level that holds a table, or zero when there are none.
+    function deepestLevel(borrow self) -> UNumber {
+        var deepest: UNumber = 0
+        for live in tables {
+            if live.record.level > deepest { deepest = live.record.level }
+        }
+        return deepest
+    }
+
+    /// The position of the table at `level` with the smallest file number,
+    /// if the level holds one.
+    function oldestAt(borrow self, level: UNumber) -> UNumber? {
+        var oldest: UNumber? = .None
+        for (index, live) in tables.enumerated() {
+            if live.record.level != level { continue }
+            match oldest {
+                Some(best) -> if live.record.number < tables[best].record.number {
+                    oldest = .Some(index)
+                }
+                None -> oldest = .Some(index)
+            }
+        }
+        return oldest
+    }
+}
+
+/// Key ranges of table records.
+extend TableRecord {
+    /// Whether any key from `smallest` to `largest` lies in this table's range.
+    function overlaps(borrow self, smallest: borrow [UN8], largest: borrow [UN8]) -> Bool {
+        return compareKeys(self.smallest, largest) != .Greater && compareKeys(
+            self.largest,
+            smallest
+        ) != .Less
+    }
+}

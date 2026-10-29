@@ -1,0 +1,234 @@
+//! Tests for the store alone: batched writes and deletes, reads, ordered scans, reopening from the log, and flushing and compacting past the memory limit.
+import Foundation
+import KiraDB
+
+// The store alone: writes and deletes through batches, reads, ordered scans,
+// reopening from the log, and flushing and compacting past the memory limit.
+// Stores live under karc-work: work state is never kept in /tmp.
+
+/// Where the store tests keep their directories, and how large a value a big write holds.
+namespace StoreTest {
+    let root: String = "/Users/priamc/Code/kira-projects/karc-work/kiradb-tests"
+    // Large enough that a few hundred puts fill a memory table.
+    let bigValueBytes: UNumber = 65536
+}
+
+/// An empty directory for one test's store, cleaned of an earlier run.
+function emptyDirectory(name: borrow String) -> Result<String, FileFailure> {
+    let path = StoreTest.root + "/" + name
+    for directory in [StoreTest.root, path] {
+        if isDirectory(directory) { continue }
+        match makeDirectory(directory) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+    }
+    var entries: [String] = []
+    match listDirectory(path) {
+        Ok(listing) -> entries = listing.entries
+        Error(failure) -> return .Error(failure)
+    }
+    for entry in entries {
+        match removePath(path + "/" + entry) {
+            Ok -> {}
+            Error(failure) -> return .Error(failure)
+        }
+    }
+    return .Ok(path)
+}
+
+/// A store in a new, empty directory.
+function freshStore(name: borrow String) -> Result<Store, StorageFailure> {
+    return match emptyDirectory(name) {
+        Ok(path) -> openStore(path)
+        Error(failure) -> .Error(.FileSystem(failure))
+    }
+}
+
+/// What `key` reads as: its value as text, `none`, or why it failed.
+function readText(store: borrow Store, key: borrow String) -> String {
+    return match store.get(key.utf8()) {
+        Ok(found) -> match found {
+            Some(value) -> textOf(value)
+            None -> "none"
+        }
+        Error(failure) -> traceText(failure)
+    }
+}
+
+/// The text of `bytes`, or the word `bytes` when they are not valid text.
+function textOf(bytes: borrow [UN8]) -> String {
+    return match textFromBytes(bytes) {
+        Some(text) -> text
+        None -> "bytes"
+    }
+}
+
+/// Writes `batch` and fails the test with the reason when the write fails.
+function expectWritten(store: borrow mut Store, batch: borrow WriteBatch) {
+    match store.write(batch) {
+        // The write landed; there is nothing further to check.
+        Ok -> {}
+        Error(failure) -> expect!((traceText(failure)) == "")
+    }
+}
+
+/// A batch holding one put of `value` under `key`.
+function putBatch(key: borrow String, value: borrow String) -> WriteBatch {
+    var batch = WriteBatch()
+    batch.put(key.utf8(), value.utf8())
+    return batch
+}
+
+/// `count` puts of a large value under keys `k0`, `k1`..., each in its own
+/// batch, the value's first byte its key's number modulo 256. Stops at the
+/// first failed write.
+function bigWrites(store: borrow mut Store, count: UNumber) -> Result<Void, StorageFailure> {
+    for index in 0..count {
+        var value: [UN8] = []
+        for _ in 0..StoreTest.bigValueBytes { value.append(UN8(index % 256)) }
+        var batch = WriteBatch()
+        batch.put("k\(index)".utf8(), move value)
+        try store.write(batch)
+    }
+    return .Ok
+}
+
+/// What a big write's key reads as: its value's length and first byte.
+function bigText(store: borrow Store, index: UNumber) -> String {
+    return match store.get("k\(index)".utf8()) {
+        Ok(found) -> match found {
+            Some(value) -> "\(value.count):\(value[0])"
+            None -> "none"
+        }
+        Error(failure) -> traceText(failure)
+    }
+}
+
+/// A batch that writes two keys and then deletes one of them reads back as
+/// the survivor, and the deleted key reads as none.
+@Test
+function deletedKeysReadAsNone() {
+    var open = match freshStore("store-delete") {
+        Ok(store) -> store
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    var batch = WriteBatch()
+    batch.put("a".utf8(), "1".utf8())
+    batch.put("b".utf8(), "2".utf8())
+    expectWritten(open, batch)
+    var removal = WriteBatch()
+    removal.delete("a".utf8())
+    expectWritten(open, removal)
+    expect!((readText(open, "a")) == "none")
+    expect!((readText(open, "b")) == "2")
+    expect!((readText(open, "c")) == "none")
+}
+
+/// A store closed and opened again replays its log: the latest write wins.
+@Test
+function reopenReplaysTheLog() {
+    let path = match emptyDirectory("store-reopen") {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    var open = match openStore(path) {
+        Ok(store) -> store
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expectWritten(open, putBatch("a", "1"))
+    expectWritten(open, putBatch("a", "2"))
+    match open.close() {
+        Ok -> {}
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    let outcome = match openStore(path) {
+        Ok(reopened) -> readText(reopened, "a")
+        Error(failure) -> traceText(failure)
+    }
+    expect!((outcome) == "2")
+}
+
+/// A scan returns the keys in range, in order, and skips the deleted and the
+/// out-of-range ones.
+@Test
+function scanReturnsOnlyKeysInRangeInOrder() {
+    var open = match freshStore("store-scan") {
+        Ok(store) -> store
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    var batch = WriteBatch()
+    for key in ["d", "a", "c", "b", "e"] { batch.put(key.utf8(), key.utf8()) }
+    batch.delete("c".utf8())
+    expectWritten(open, batch)
+    var found: [String] = []
+    match open.scan("b".utf8(), "e".utf8()) {
+        Ok(pairs) -> {
+            for pair in pairs { found.append(textOf(pair.key)) }
+        }
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expect!((found.count) == (2))
+    expect!((joined(found, ",")) == "b,d")
+}
+
+/// Past four memory tables: four flushes, a level 0 compaction, one more flush;
+/// the values are still there before and after a reopen.
+@Test
+function flushedAndCompactedValuesSurviveReopen() {
+    let path = match emptyDirectory("store-compact") {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    var open = match openStore(path) {
+        Ok(store) -> store
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    match bigWrites(open, 330) {
+        // Every big write landed.
+        Ok -> {}
+        Error(failure) -> expect!((traceText(failure)) == "")
+    }
+    expect!((bigText(open, 0)) == "65536:0")
+    expect!((bigText(open, 329)) == "65536:73")
+    match open.close() {
+        Ok -> {}
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    let reopened = match openStore(path) {
+        Ok(store) -> store
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expect!((bigText(reopened, 300)) == "65536:44")
+    expect!((bigText(reopened, 330)) == "none")
+}

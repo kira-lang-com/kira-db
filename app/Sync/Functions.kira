@@ -1,0 +1,155 @@
+//! Queries and mutations: the functions a program offers, run against a database
+//! as a recorded run.
+//!
+//! A query reads the database and answers a value. A mutation may also write, and its
+//! writes are kept only when it answers success. Both run as recorded runs, so the
+//! key ranges a query read and the writes a mutation made are known when it ends
+//! (SPEC sections 6.1 and 8.4).
+import Foundation
+
+/// Who runs a function: the client the server named, and the identity the server's `authenticate` answered for its credentials (SPEC section 8.1).
+public struct Caller {
+    /// The client's number.
+    let client: Number
+    /// The identity the server's `authenticate` gave the client's credentials.
+    let identity: Value
+}
+
+/// Why a function failed.
+public enum FunctionFailure {
+    /// The database failed under the function.
+    Database(DatabaseFailure)
+    /// A table operation failed under the function.
+    Table(TableFailure)
+    /// The function refused its arguments or the state it found.
+    Refused(String)
+    /// No query or mutation has this name. Carries the name.
+    NoSuchFunction(String)
+}
+
+/// A named query: a function that reads the database and answers a value.
+public struct QueryFunction {
+    /// The query's name.
+    let name: String
+    /// Runs the query against the database, as `caller`, with `arguments`.
+    let run: (borrow Database, borrow Caller, borrow Value) -> Result<Value, FunctionFailure>
+}
+
+/// A named mutation: a function that may write the database and answers a value.
+public struct MutationFunction {
+    /// The mutation's name.
+    let name: String
+    /// Runs the mutation against the database, as `caller`, with `arguments`. Its writes are kept only when it answers `.Ok`.
+    let run: (borrow mut Database, borrow Caller, borrow Value) -> Result<Value, FunctionFailure>
+}
+
+/// The program's queries and mutations. The same functions are in the server and in every client.
+public struct Functions {
+    /// The queries, by name.
+    let queries: [QueryFunction]
+    /// The mutations, by name.
+    let mutations: [MutationFunction]
+}
+
+/// A function's answer and the ranges it read.
+struct FunctionRun {
+    /// The answer the function gave.
+    let answer: Result<Value, FunctionFailure>
+    /// The key ranges the function read.
+    let reads: KeyRanges
+}
+
+/// A mutation's answer and the writes it holds: none when it failed.
+struct MutationRun {
+    /// The answer the mutation gave.
+    let answer: Result<Value, FunctionFailure>
+    /// The writes the mutation made, to apply when it succeeded.
+    let batch: WriteBatch
+}
+
+extend Database {
+    /// Runs the query as a recorded run (SPEC section 6.1).
+    function runQuery(
+        borrow mut self,
+        functions: borrow Functions,
+        name: borrow String,
+        caller: borrow Caller,
+        arguments: borrow Value
+    ) -> FunctionRun {
+        beginRecording()
+        let answer = queryAnswer(functions, name, caller, arguments)
+        let run = endRecording()
+        return FunctionRun { answer: answer, reads: rangesOf(run.reads) }
+    }
+
+    /// Runs the query called `name` against the database and returns its answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NoSuchFunction` when no query has the name.
+    function queryAnswer(
+        borrow self,
+        functions: borrow Functions,
+        name: borrow String,
+        caller: borrow Caller,
+        arguments: borrow Value
+    ) -> Result<Value, FunctionFailure> {
+        for query in functions.queries {
+            if query.name == name { return query.run(self, caller, arguments) }
+        }
+        return .Error(.NoSuchFunction(copy name))
+    }
+
+    /// Runs the mutation as a recorded run of its own.
+    function runMutation(
+        borrow mut self,
+        functions: borrow Functions,
+        name: borrow String,
+        caller: borrow Caller,
+        arguments: borrow Value
+    ) -> MutationRun {
+        beginRecording()
+        let answer = mutationAnswer(functions, name, caller, arguments)
+        let run = endRecording()
+        return match answer {
+            Ok(value) -> MutationRun { answer: .Ok(value), batch: run.batch }
+            Error(failure) -> MutationRun { answer: .Error(failure), batch: WriteBatch() }
+        }
+    }
+
+    /// Runs the mutation inside the recorded run in progress, keeping its
+    /// writes only when it answers `Ok`.
+    function mutationAnswer(
+        borrow mut self,
+        functions: borrow Functions,
+        name: borrow String,
+        caller: borrow Caller,
+        arguments: borrow Value
+    ) -> Result<Value, FunctionFailure> {
+        let before = mark()
+        for mutation in functions.mutations {
+            if mutation.name != name { continue }
+            match mutation.run(self, caller, arguments) {
+                Ok(value) -> return .Ok(value)
+                Error(failure) -> {
+                    rollBack(before)
+                    return .Error(failure)
+                }
+            }
+        }
+        return .Error(.NoSuchFunction(copy name))
+    }
+}
+
+/// The conversions `try` makes inside a function.
+extend FunctionFailure {
+    /// Returns the database failure as a `Database` function failure.
+    function from(failure: DatabaseFailure) -> FunctionFailure {
+        return .Database(failure)
+    }
+
+    /// Returns the table failure as a `Table` function failure.
+    function from(failure: TableFailure) -> FunctionFailure {
+        return .Table(failure)
+    }
+}

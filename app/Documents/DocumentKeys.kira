@@ -1,0 +1,68 @@
+//! The keys documents are stored under.
+//!
+//! A document's key is its collection's prefix, followed by the encoded key value.
+//! The prefix holds the document marker and the collection name, so the keys of two
+//! collections never mix (SPEC section 6).
+import Foundation
+
+/// SPEC section 6: a document lives at `encode(Text("d"), Text(collection), key)`.
+namespace DocumentSpace {
+    /// The text that marks a key as a document key.
+    let marker: String = "d"
+}
+
+/// Returns the store key of the document under `key` in `collection`.
+///
+/// # Errors
+///
+/// Returns `.Key` when `key` is a list or a document.
+function documentKey(
+    collection: borrow Collection,
+    key: borrow Value
+) -> Result<[UN8], DatabaseFailure> {
+    var encoded = collectionPrefix(collection)
+    try encoded.appendKeyPart(key)
+    return .Ok(encoded)
+}
+
+/// The bytes every key in the collection starts with.
+function collectionPrefix(collection: borrow Collection) -> [UN8] {
+    var prefix: [UN8] = []
+    prefix.appendTextKey(DocumentSpace.marker)
+    prefix.appendTextKey(collection.name)
+    return prefix
+}
+
+/// A stored key and document, read back. The key's first `prefixBytes` are
+/// its collection's prefix, which the scan that found it already matched.
+function keyedDocument(
+    pair: borrow KeyValue,
+    prefixBytes: UNumber
+) -> Result<KeyedDocument, DatabaseFailure> {
+    let key = try decodeLastKeyPart(pair.key, prefixBytes)
+    let document = try documentOf(copy pair.value)
+    return .Ok(KeyedDocument { key: key, document: document })
+}
+
+/// Decodes the bytes of a stored document.
+///
+/// # Errors
+///
+/// Returns `.Corrupt` when the bytes do not decode, and `.NotADocument` when they decode to a value that is not a document.
+function documentOf(bytes: [UN8]) -> Result<Document, DatabaseFailure> {
+    let value = try decodeValue(move bytes)
+    return match value.document() {
+        Some(document) -> .Ok(document)
+        None -> .Error(.NotADocument)
+    }
+}
+
+/// Decodes the bytes of a stored document and returns it as present.
+///
+/// # Errors
+///
+/// Returns the failure of decoding the document.
+function someDocument(bytes: [UN8]) -> Result<Document?, DatabaseFailure> {
+    let document = try documentOf(move bytes)
+    return .Ok(.Some(document))
+}

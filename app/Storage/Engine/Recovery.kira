@@ -1,0 +1,77 @@
+//! Recovery: reopening a store from its manifest, its tables and its log.
+//!
+//! The manifest names the tables and the current log. Recovery opens the tables,
+//! replays the log into a memory table, removes files the manifest does not name, and
+//! settles the replayed writes under a new log. The steps are SPEC section 5.2 and
+//! 5.4.
+import Foundation
+
+/// Reopens the store the manifest in `directory` describes: its tables opened,
+/// its log replayed into memory, then settled under a new log.
+function recoverStore(directory: borrow String) -> Result<Store, StorageFailure> {
+    var manifest = try loadManifest(directory)
+    try removeOrphans(directory, manifest)
+    var tables: [LiveTable] = []
+    for record in manifest.tables {
+        let live = try openLiveTable(directory, record)
+        tables.append(live)
+    }
+    var memory = MemoryTable()
+    let batches = try readLog(logPath(directory, manifest.log))
+    for batch in batches {
+        memory.insertBatch(batch)
+        manifest.lastSequence = max(manifest.lastSequence, batch.sequence)
+    }
+    let replayed = manifest.log
+    let number = manifest.takeFileNumber()
+    manifest.log = number
+    let log = try createLog(logPath(directory, number))
+    var store = Store {
+        directory: copy directory,
+        manifest: manifest,
+        log: log,
+        memory: memory,
+        tables: byRecency(move tables)
+    }
+    // The replayed writes settle into a table and the log `replayed` goes.
+    try store.settle(replayed)
+    return .Ok(store)
+}
+
+/// Opens the table a manifest record names.
+///
+/// # Errors
+///
+/// Returns the failure of reading the table's size or opening it.
+function openLiveTable(
+    directory: borrow String,
+    record: borrow TableRecord
+) -> Result<LiveTable, StorageFailure> {
+    let path = tablePath(directory, record.number)
+    let size = try fileSize(path)
+    let table = try openTable(path)
+    return .Ok(LiveTable { record: copy record, table: table, size: size })
+}
+
+/// Removes the logs and tables the manifest does not name: a flush or
+/// compaction that crashed before or after storing its manifest left them.
+/// Their numbers were taken, so the next file number moves past them (SPEC
+/// section 5.2: file numbers are never reused).
+function removeOrphans(
+    directory: borrow String,
+    manifest: borrow mut Manifest
+) -> Result<Void, StorageFailure> {
+    let listing = try listDirectory(directory)
+    var kept: [String] = ["\(manifest.log).log"]
+    for record in manifest.tables { kept.append("\(record.number).table") }
+    for name in listing.entries {
+        if !(name.endsWith(".log") || name.endsWith(".table")) || kept.contains(name) { continue }
+        match parseNumber(name.split(".")[0]) {
+            Some(number) -> if number >= manifest.nextFile { manifest.nextFile = number + 1 }
+            // A name with no number took none.
+            None -> {}
+        }
+        try removePath(filePath(directory, name))
+    }
+    return .Ok
+}

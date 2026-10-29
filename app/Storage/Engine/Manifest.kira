@@ -1,0 +1,276 @@
+//! The manifest: the file that names the tables and logs that make up the
+//! database, and how it is read and replaced.
+//!
+//! The manifest is a text file, one fact to a line. It is replaced whole, never
+//! edited in place: a new copy is written beside it, synced, and renamed over it.
+//! The format is described in SPEC section 5.6.
+import Foundation
+
+// SPEC section 5.6.
+/// The names and constants of the manifest file.
+namespace ManifestFile {
+    /// The manifest's file name.
+    let name: String = "MANIFEST"
+    /// The file name a replacement manifest is written under before it is renamed over `MANIFEST`.
+    let next: String = "MANIFEST.next"
+    /// The lowercase hexadecimal digits, indexed by value.
+    let hexDigits: String = "0123456789abcdef"
+    /// The number of values one hexadecimal digit holds.
+    let nibbleValues: UNumber = 16
+    /// The number of the first log a new database writes.
+    let firstLog: UNumber = 1
+}
+
+// A sorted table as the manifest records it.
+/// A sorted table as the manifest records it.
+struct TableRecord {
+    /// The level the table sits in.
+    let level: UNumber
+    /// The file number of the table.
+    let number: UNumber
+    /// The smallest key the table holds.
+    let smallest: [UN8]
+    /// The largest key the table holds.
+    let largest: [UN8]
+}
+
+// The database's current state: the files that make it up.
+/// The database's current state: the files that make it up.
+struct Manifest {
+    /// The next file number to hand out.
+    var nextFile: UNumber
+    /// The sequence number of the last write.
+    var lastSequence: UNumber
+    /// The number of the current log.
+    var log: UNumber
+    /// The sorted tables, in the order the manifest lists them.
+    var tables: [TableRecord]
+
+    // A file number never used before.
+    /// Returns a file number that has never been used, and advances the counter.
+    function takeFileNumber(borrow mut self) -> UNumber {
+        let number = nextFile
+        nextFile += 1
+        return number
+    }
+
+    /// Returns the manifest as its text: one fact to a line, each line ending in a newline.
+    function text(borrow self) -> String {
+        var lines: [String] = ["next-file \(nextFile)", "last-sequence \(lastSequence)", "log \(log)"]
+        for table in tables {
+            lines.append(
+                "table \(table.level) \(table.number) \(hexOf(table.smallest)) \(hexOf(table.largest))"
+            )
+        }
+        var text = ""
+        for line in lines { text = text + line + "\n" }
+        return text
+    }
+}
+
+// The manifest a new database starts with: its first log, and no tables.
+/// Returns the manifest a new database starts with: its first log and no tables.
+function freshManifest() -> Manifest {
+    return Manifest {
+        nextFile: ManifestFile.firstLog + 1,
+        lastSequence: 0,
+        log: ManifestFile.firstLog,
+        tables: []
+    }
+}
+
+/// Returns the path of `name` inside `directory`.
+function filePath(directory: borrow String, name: borrow String) -> String {
+    return directory + "/" + name
+}
+
+// Replaces the manifest in `directory` whole: written beside it, synced,
+// renamed over it, and the directory synced.
+/// Replaces the manifest in `directory` with `manifest`.
+///
+/// The new text is written beside the current manifest, synced, renamed over it, and the directory is synced. A crash before the rename leaves the old manifest in place.
+///
+/// # Errors
+///
+/// Returns the failure of the first step that cannot be completed.
+function storeManifest(
+    directory: borrow String,
+    manifest: borrow Manifest
+) -> Result<Void, StorageFailure> {
+    let next = filePath(directory, ManifestFile.next)
+    if fileExists(next) { try removePath(next) }
+    try writeNewFile(next, manifest.text().utf8())
+    try renamePath(next, filePath(directory, ManifestFile.name))
+    return match syncDirectory(directory) {
+        Ok -> .Ok
+        Error(failure) -> .Error(.File((copy directory, failure)))
+    }
+}
+
+// The manifest in `directory`.
+/// Reads the manifest in `directory`.
+///
+/// # Errors
+///
+/// Returns the failure of the read, or the failure of the parse when the text is not a manifest.
+function loadManifest(directory: borrow String) -> Result<Manifest, StorageFailure> {
+    let contents = try readFile(filePath(directory, ManifestFile.name))
+    return parseManifest(contents.text)
+}
+
+// One line of the manifest.
+/// One fact a manifest line states.
+enum ManifestFact {
+    /// The next file number.
+    NextFile(UNumber)
+    /// The last sequence number.
+    LastSequence(UNumber)
+    /// The current log's number.
+    Log(UNumber)
+    /// One sorted table.
+    Table(TableRecord)
+}
+
+/// Reads a manifest from its text.
+///
+/// Lines that state no fact are refused, and a manifest with no log is incomplete.
+///
+/// # Errors
+///
+/// Returns `ManifestLine` for the first line that states no fact, and `ManifestIncomplete` when the text names no log.
+function parseManifest(text: borrow String) -> Result<Manifest, StorageFailure> {
+    var manifest = Manifest { nextFile: 0, lastSequence: 0, log: 0, tables: [] }
+    for (index, line) in text.split("\n").enumerated() {
+        if line.count == 0 { continue }
+        match factOf(line.split(" ")) {
+            Some(fact) -> manifest.apply(move fact)
+            None -> return .Error(.ManifestLine(index + 1))
+        }
+    }
+    if manifest.log == 0 { return .Error(.ManifestIncomplete) }
+    return .Ok(manifest)
+}
+
+/// Applying facts read from a manifest.
+extend Manifest {
+    /// Records `fact` in the manifest.
+    function apply(borrow mut self, fact: ManifestFact) {
+        match fact {
+            NextFile(number) -> nextFile = number
+            LastSequence(sequence) -> lastSequence = sequence
+            Log(number) -> log = number
+            Table(record) -> tables.append(record)
+        }
+    }
+}
+
+// The fact a line's words state, when they state one.
+/// Returns the fact the words of a line state, or `.None` when they state none.
+function factOf(words: borrow [String]) -> ManifestFact? {
+    if words.count == 2 {
+        return match parseNumber(words[1]) {
+            Some(value) -> numberFact(words[0], value)
+            None -> .None
+        }
+    }
+    if words.count != 5 || words[0] != "table" { return .None }
+    return tableFact(words)
+}
+
+/// Returns the fact a one-number line states, by its name, or `.None` for an unknown name.
+function numberFact(name: borrow String, value: UNumber) -> ManifestFact? {
+    return match name {
+        "next-file" -> .Some(.NextFile(value))
+        "last-sequence" -> .Some(.LastSequence(value))
+        "log" -> .Some(.Log(value))
+        else -> .None
+    }
+}
+
+// `table <level> <n> <smallest key hex> <largest key hex>`.
+/// Returns the table fact a `table` line states, or `.None` when its numbers or keys do not read.
+function tableFact(words: borrow [String]) -> ManifestFact? {
+    return match parseNumber(words[1]) {
+        Some(level) -> match parseNumber(words[2]) {
+            Some(number) -> tableWithKeys(level, number, words[3], words[4])
+            None -> .None
+        }
+        None -> .None
+    }
+}
+
+/// Returns the table fact for a level, a number and the hexadecimal keys, or `.None` when a key is not hexadecimal.
+function tableWithKeys(
+    level: UNumber,
+    number: UNumber,
+    smallestHex: borrow String,
+    largestHex: borrow String
+) -> ManifestFact? {
+    return match bytesOfHex(smallestHex) {
+        Some(smallest) -> match bytesOfHex(largestHex) {
+            Some(largest) -> .Some(
+                .Table(
+                    TableRecord {
+                        level: level,
+                        number: number,
+                        smallest: smallest,
+                        largest: largest
+                    }
+                )
+            )
+            None -> .None
+        }
+        None -> .None
+    }
+}
+
+/// Returns `bytes` as lowercase hexadecimal, two digits to a byte.
+function hexOf(bytes: borrow [UN8]) -> String {
+    var text = ""
+    for byte in bytes {
+        text = text + hexDigit(floor(byte / ManifestFile.nibbleValues)) + hexDigit(
+            byte % ManifestFile.nibbleValues
+        )
+    }
+    return text
+}
+
+/// Returns the hexadecimal digit for `value`, which must be below sixteen.
+function hexDigit(value: UNumber) -> String {
+    return ManifestFile.hexDigits.substring(value, value + 1)
+}
+
+/// Returns the bytes that hexadecimal `text` names, or `.None` when its length is odd or a character is not a hexadecimal digit.
+function bytesOfHex(text: borrow String) -> [UN8]? {
+    let digits = text.utf8()
+    if digits.count % 2 != 0 { return .None }
+    var bytes: [UN8] = []
+    for index in 0..digits.count / 2 {
+        match byteOfNibbles(digits[index * 2], digits[index * 2 + 1]) {
+            Some(byte) -> bytes.append(byte)
+            None -> return .None
+        }
+    }
+    return .Some(bytes)
+}
+
+/// Returns the byte made of two hexadecimal digits, or `.None` when either is not one.
+function byteOfNibbles(high: UN8, low: UN8) -> UN8? {
+    return match nibbleOf(high) {
+        Some(top) -> match nibbleOf(low) {
+            Some(bottom) -> .Some(UN8(top * ManifestFile.nibbleValues + bottom))
+            None -> .None
+        }
+        None -> .None
+    }
+}
+
+// The value of one lowercase hex digit.
+/// Returns the value of one lowercase hexadecimal digit, or `.None` for any other character.
+function nibbleOf(digit: UN8) -> UNumber? {
+    let alphabet = ManifestFile.hexDigits.utf8()
+    for (value, candidate) in alphabet.enumerated() {
+        if candidate == digit { return .Some(value) }
+    }
+    return .None
+}

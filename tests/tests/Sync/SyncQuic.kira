@@ -1,0 +1,157 @@
+//! Tests for sync over QUIC: a server and two replicas on one node.
+import Foundation
+import KiraDB
+
+/// Sync over QUIC on loopback: a server and two replicas on one node.
+struct QuicRig {
+    var node: QuicNode
+    var host: SyncHost
+    var links: [SyncLink]
+    let address: String
+
+    /// Dials the server from link `index` with `credentials`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the link's failure as text.
+    function dial(borrow mut self, index: UNumber, credentials: Value) -> Result<Void, String> {
+        let dial = QuicDial {
+            address: copy address,
+            serverName: "localhost",
+            anchors: quicTestAnchors()
+        }
+        return match links[index].start(node, move dial, move credentials) {
+            Ok -> .Ok
+            Error(failure) -> .Error(traceText(failure))
+        }
+    }
+
+    /// Hands the node's events to their bindings until `done` holds or five
+    /// seconds pass; answers whether it held.
+    function run(borrow mut self, done: (borrow mut QuicRig) -> Bool) -> Bool {
+        let deadline = node.now().plus(5 * QuicTime.second)
+        while node.now().raw < deadline.raw {
+            if done(self) { return true }
+            for event in node.wait(.Some(deadline)) {
+                if host.event(node, event) { continue }
+                for index in 0..links.count {
+                    if links[index].event(node, event) { break }
+                }
+            }
+        }
+        return done(self)
+    }
+
+    /// The view of query `query` on link `index`, as text, or the failure as text.
+    function shown(borrow mut self, index: UNumber, query: Number) -> String {
+        return match links[index].replica.result(query) {
+            Ok(value) -> traceText(value)
+            Error(failure) -> traceText(failure)
+        }
+    }
+}
+
+/// A rig with a server and two replicas on one QUIC node.
+///
+/// # Errors
+///
+/// Returns a message when the node cannot be opened.
+function quicRig(name: borrow String) -> Result<QuicRig, String> {
+    var node = try openQuicNode(QuicNodeOptions { protocol: "kiradb" }) otherwise return .Error(
+        "no node"
+    )
+    let serverPath = try emptyDirectory(name + "-server") otherwise return .Error("no directory")
+    let server = try openSyncServer(serverPath, todoFunctions(), anyone) otherwise return .Error(
+        "no server"
+    )
+    let host = try hostSync(
+        move server,
+        node,
+        "127.0.0.1:0",
+        quicTestIdentity()
+    ) otherwise return .Error("no host")
+    let address = try node.listenerAddress(host.listener) otherwise return .Error("no address")
+    var links: [SyncLink] = []
+    for index in 0..2 {
+        let path = try emptyDirectory(name + "-replica-\(index)") otherwise return .Error(
+            "no directory"
+        )
+        let replica = try openReplica(path, todoFunctions()) otherwise return .Error("no replica")
+        links.append(linkSync(move replica))
+    }
+    return .Ok(QuicRig { node: node, host: host, links: links, address: address })
+}
+
+/// One replica's mutation reaches the other's subscription over QUIC: both
+/// sessions open, the mutation arrives, and the view shows it.
+function scenarioQuicSync() -> Result<[String], String> {
+    var rig = try quicRig("sync-quic")
+    let watched = rig.links[1].replica.subscribe("todos", .Null)
+    try rig.dial(0, .Text("ada"))
+    try rig.dial(1, .Text("alan"))
+    let opened = rig.run({ open in return open.links[0].connected() && open.links[1].connected() })
+    try rig.links[0].replica.mutate("addTodo", todo(1, "over quic")) otherwise return .Error(
+        "no mutate"
+    )
+    rig.links[0].send(rig.node)
+    let arrived = rig.run(
+        {
+            open in return open.links[0].replica.pending.count == 0 && open.links[1].replica.ready(
+                watched
+            ) && open.shown(1, watched).contains("over quic")
+        }
+    )
+    let shown = rig.shown(1, watched)
+    rig.node.shutdown()
+    return .Ok(["\(opened)", "\(arrived)", shown])
+}
+
+/// Credentials the server refuses end the session over QUIC: the link
+/// disconnects, and the reason is answered.
+function scenarioQuicRefused() -> Result<[String], String> {
+    var rig = try quicRig("sync-quic-refused")
+    try rig.dial(0, .Number(7))
+    let ended = rig.run({ open in return open.links[0].connection.isNone() })
+    var reason = ""
+    for event in rig.links[0].replica.takeEvents() {
+        match event {
+            Refused(given) -> reason = given
+            Welcomed(_) -> {}
+            Changed(_) -> {}
+            Done(_) -> {}
+        }
+    }
+    let connected = rig.links[0].connected()
+    rig.node.shutdown()
+    return .Ok(["\(ended)", reason, "\(connected)"])
+}
+
+/// A mutation from one replica reaches the other over QUIC.
+@Test
+function mutationReachesTheOtherReplicaOverQuic() {
+    let parts = match scenarioQuicSync() {
+        Ok(found) -> found
+        Error(reason) -> {
+            expect!((reason) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "true")
+    expect!((parts[1]) == "true")
+    expect!((parts[2]) == "Value.List([Value.Text(\"over quic\")])")
+}
+
+/// Refused credentials over QUIC end the link and carry the reason.
+@Test
+function refusedCredentialsEndTheQuicLink() {
+    let parts = match scenarioQuicRefused() {
+        Ok(found) -> found
+        Error(reason) -> {
+            expect!((reason) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "true")
+    expect!((parts[1]) == "who are you")
+    expect!((parts[2]) == "false")
+}

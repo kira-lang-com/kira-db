@@ -1,0 +1,270 @@
+//! The wire form of sync messages: each message is a typed document, framed with its
+//! length, so a stream of frames can be split back into messages (SPEC section 8.3).
+//!
+//! A frame is a varint length followed by the bytes of a value. A message's value is
+//! a document with a `type` field that names the kind of message, and the fields that
+//! kind carries.
+import Foundation
+
+/// Why bytes are not a message (SPEC section 8.3).
+public enum MessageFailure {
+    /// The bytes do not read as a value at all.
+    Decode(DecodeFailure)
+    /// The value is not a message of a known type, or lacks a field.
+    Malformed
+}
+
+/// The bytes of a client message, framed so a stream can be split back into messages.
+public function encodeClientMessage(message: borrow ClientMessage) -> [UN8] {
+    return frameOf(clientDocument(message))
+}
+
+/// The bytes of a server message, framed so a stream can be split back into messages.
+public function encodeServerMessage(message: borrow ServerMessage) -> [UN8] {
+    return frameOf(serverDocument(message))
+}
+
+/// A frame: the value codec's length, then the value codec.
+function frameOf(document: Document) -> [UN8] {
+    let body = encodeValue(.Document(document))
+    var frame: [UN8] = []
+    frame.appendVarint(body.count)
+    frame.appendAll(body)
+    return frame
+}
+
+/// Returns the document of a client message, with its type and fields.
+function clientDocument(message: borrow ClientMessage) -> Document {
+    return match message {
+        Hello(hello) -> {
+            var document = typed("hello")
+            document.set("client", .Number(hello.client))
+            document.set("credentials", copy hello.credentials)
+            document
+        }
+        Subscribe(subscribe) -> {
+            var document = typed("subscribe")
+            document.set("query", .Number(subscribe.query))
+            document.set("name", .Text(copy subscribe.name))
+            document.set("arguments", copy subscribe.arguments)
+            document
+        }
+        Unsubscribe(query) -> {
+            var document = typed("unsubscribe")
+            document.set("query", .Number(query))
+            document
+        }
+        Mutate(mutate) -> {
+            var document = typed("mutate")
+            document.set("number", .Number(mutate.number))
+            document.set("name", .Text(copy mutate.name))
+            document.set("arguments", copy mutate.arguments)
+            document
+        }
+    }
+}
+
+/// Returns the document of a server message, with its type and fields.
+function serverDocument(message: borrow ServerMessage) -> Document {
+    return match message {
+        Welcome(caller) -> {
+            var document = typed("welcome")
+            document.set("client", .Number(caller.client))
+            document.set("identity", copy caller.identity)
+            document
+        }
+        Refused(reason) -> {
+            var document = typed("refused")
+            document.set("reason", .Text(copy reason))
+            document
+        }
+        SyncTransition(transition) -> transitionDocument(transition)
+    }
+}
+
+/// Returns the document of a transition: its version, applied number, changes, ready queries and results.
+function transitionDocument(transition: borrow SyncTransition) -> Document {
+    var document = typed("transition")
+    document.set("version", .Number(transition.version))
+    document.set("applied", .Number(transition.applied))
+    var changes: [Value] = []
+    for change in transition.changes { changes.append(.Document(changeDocument(change))) }
+    document.set("changes", .List(changes))
+    var ready: [Value] = []
+    for query in transition.ready { ready.append(.Number(query)) }
+    document.set("ready", .List(ready))
+    var results: [Value] = []
+    for result in transition.results { results.append(.Document(resultDocument(result))) }
+    document.set("results", .List(results))
+    return document
+}
+
+/// Returns the document of a change: a write with its key and value, a hold with its range and pairs, or a release with its range.
+function changeDocument(change: borrow Change) -> Document {
+    return match change {
+        Write(written) -> {
+            var document = typed("write")
+            document.set("key", .Bytes(copy written.key))
+            document.set(
+                "value",
+                match written.value {
+                    Some(value) -> .Bytes(copy value)
+                    None -> .Null
+                }
+            )
+            document
+        }
+        Hold(held) -> {
+            var document = rangeDocument("hold", held.range)
+            var pairs: [Value] = []
+            for pair in held.pairs {
+                var entry = Document()
+                entry.set("key", .Bytes(copy pair.key))
+                entry.set("value", .Bytes(copy pair.value))
+                pairs.append(.Document(entry))
+            }
+            document.set("pairs", .List(pairs))
+            document
+        }
+        Release(range) -> rangeDocument("release", range)
+    }
+}
+
+/// Returns the document of a key range, with the message kind `kind`.
+function rangeDocument(kind: String, range: borrow KeyRange) -> Document {
+    var document = typed(move kind)
+    document.set("start", .Bytes(copy range.start))
+    document.set("end", .Bytes(copy range.end))
+    return document
+}
+
+/// Returns the document of a mutation result: its number, and its value, failure or the skipped flag.
+function resultDocument(result: borrow MutationResult) -> Document {
+    var document = Document()
+    document.set("number", .Number(result.number))
+    match result.outcome {
+        Answered(value) -> document.set("value", copy value)
+        Failed(reason) -> document.set("failure", .Text(copy reason))
+        Skipped -> document.set("skipped", .Bool(true))
+    }
+    return document
+}
+
+/// Returns an empty document whose type is `kind`.
+function typed(kind: String) -> Document {
+    var document = Document()
+    document.set("type", .Text(move kind))
+    return document
+}
+
+/// Reads frames off a byte stream: each frame is a length and its body, and a body may arrive in pieces.
+public struct FrameReader {
+    /// The bytes received that do not yet make a whole frame.
+    var pending: [UN8] = []
+
+    /// Adds `bytes` to the stream and answers the body of every whole frame they complete, in order. Bytes of a frame not yet complete wait for the next call.
+    ///
+    /// # Failures
+    /// `.Decode` when a frame's length does not read.
+    function feed(borrow mut self, bytes: borrow [UN8]) -> Result< [[UN8]], MessageFailure> {
+        pending.appendAll(bytes)
+        var bodies: [[UN8]] = []
+        var cursor = ByteCursor { bytes: copy pending }
+        var consumed: UNumber = 0
+        while wholeVarintAt(pending, cursor.offset) {
+            let length = try cursor.readVarint()
+            if pending.count - cursor.offset < length { break }
+            let body = try cursor.readBytes(length)
+            bodies.append(body)
+            consumed = cursor.offset
+        }
+        var rest: [UN8] = []
+        for index in consumed..pending.count { rest.append(pending[index]) }
+        pending = rest
+        return .Ok(bodies)
+    }
+}
+
+/// Whether a whole variable-length number starts at `offset`: a byte without
+/// the top bit ends it (SPEC section 3.2).
+function wholeVarintAt(bytes: borrow [UN8], offset: UNumber) -> Bool {
+    for index in offset..bytes.count {
+        if bytes[index] < 128 { return true }
+    }
+    return false
+}
+
+/// Reads a client message from a frame's body.
+///
+/// # Failures
+/// `.Decode` when the body is not a value, or `.Malformed` when it is not a known client message.
+public function decodeClientMessage(body: [UN8]) -> Result<ClientMessage, MessageFailure> {
+    let document = try messageDocument(move body)
+    let kind = try textOf(document, "type")
+    if kind == "hello" {
+        let client = try numberOf(document, "client")
+        let credentials = try valueOf(document, "credentials")
+        return .Ok(.Hello(Hello { client: client, credentials: credentials }))
+    }
+    if kind == "subscribe" {
+        let query = try numberOf(document, "query")
+        let name = try textOf(document, "name")
+        let arguments = try valueOf(document, "arguments")
+        return .Ok(.Subscribe(Subscribe { query: query, name: name, arguments: arguments }))
+    }
+    if kind == "unsubscribe" {
+        let query = try numberOf(document, "query")
+        return .Ok(.Unsubscribe(query))
+    }
+    if kind == "mutate" {
+        let number = try numberOf(document, "number")
+        let name = try textOf(document, "name")
+        let arguments = try valueOf(document, "arguments")
+        return .Ok(.Mutate(Mutate { number: number, name: name, arguments: arguments }))
+    }
+    return .Error(.Malformed)
+}
+
+/// Reads a server message from a frame's body.
+///
+/// # Failures
+/// `.Decode` when the body is not a value, or `.Malformed` when it is not a known server message.
+public function decodeServerMessage(body: [UN8]) -> Result<ServerMessage, MessageFailure> {
+    let document = try messageDocument(move body)
+    let kind = try textOf(document, "type")
+    if kind == "welcome" {
+        let client = try numberOf(document, "client")
+        let identity = try valueOf(document, "identity")
+        return .Ok(.Welcome(Caller { client: client, identity: identity }))
+    }
+    if kind == "refused" {
+        let reason = try textOf(document, "reason")
+        return .Ok(.Refused(reason))
+    }
+    if kind == "transition" {
+        let transition = try transitionOf(document)
+        return .Ok(.SyncTransition(transition))
+    }
+    return .Error(.Malformed)
+}
+
+/// Decodes the bytes of a message body into its document.
+///
+/// # Errors
+///
+/// Returns `Decode` when the bytes are not a value, and `Malformed` when the value is not a document.
+function messageDocument(body: [UN8]) -> Result<Document, MessageFailure> {
+    let value = try decodeValue(move body)
+    return match value.document() {
+        Some(document) -> .Ok(document)
+        None -> .Error(.Malformed)
+    }
+}
+
+/// Converting decode failures when `try` passes them up.
+extend MessageFailure {
+    /// Returns the decode failure as a `Decode` message failure.
+    function from(failure: DecodeFailure) -> MessageFailure {
+        return .Decode(failure)
+    }
+}

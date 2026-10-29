@@ -1,0 +1,10 @@
+//! The KiraDB benchmark package, run against the library in the parent directory.
+/// KiraDB against SQLite: `kira run bench --release`, then
+/// `python3 bench/sqlite.py`, on the same machine.
+construct KiraDBBench extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let dependencies: [Dependency] = [
+        Dependency { name: "KiraDB", path: ".." }
+    ]
+}

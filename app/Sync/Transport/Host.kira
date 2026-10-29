@@ -1,0 +1,198 @@
+//! The server end of the sync transport: connections accepted over QUIC, each
+//! carrying one server session on one stream.
+//!
+//! The host hands each received frame to its session, and writes each message the
+//! session gives back to that session's stream. A stream that ends, or a connection
+//! that closes, ends its session (SPEC section 8.6).
+import Foundation
+
+/// One connection the host's listener accepted.
+struct HostConnection {
+    /// The connection.
+    let connection: QuicConnectionId
+    /// The stream the session travels on, or `.None` before it opens.
+    var stream: QuicStreamId? = .None
+    /// The server session the stream carries, 0 before it opens and after
+    /// it closes.
+    var session: Number = 0
+    /// Reads the frames arriving on the stream.
+    var reader: FrameReader = FrameReader()
+}
+
+/// The server end of SPEC section 8.6: a sync server's sessions over QUIC.
+public struct SyncHost {
+    /// The sync server whose sessions the host carries.
+    var server: SyncServer
+    /// The QUIC listener the host accepts connections on.
+    let listener: QuicListenerId
+    /// The accepted connections, each carrying at most one session stream.
+    var connections: [HostConnection] = []
+
+    /// Takes `event` when it is the host's own, and writes what the server gave. Answers whether it was the host's.
+    function event(
+        borrow mut self,
+        node: borrow mut QuicNode,
+        event: borrow QuicNodeEvent
+    ) -> Bool {
+        let own = take(node, event)
+        if own { flush(node) }
+        return own
+    }
+
+    /// Takes `event` when it is the host's own, answering whether it was. A new connection on the host's listener is recorded.
+    function take(borrow mut self, node: borrow mut QuicNode, event: borrow QuicNodeEvent) -> Bool {
+        match event {
+            Opened(opened) -> {
+                if opened.listener != .Some(listener) { return false }
+                connections.append(HostConnection { connection: opened.connection })
+                return true
+            }
+            Closed(closed) -> {
+                let index = match connectionIndex(closed.connection) {
+                    Some(index) -> index
+                    None -> return false
+                }
+                endSession(index)
+                dropConnection(index)
+                return true
+            }
+            StreamOpened(stream) -> {
+                let index = match connectionIndex(stream.connection) {
+                    Some(index) -> index
+                    None -> return false
+                }
+                if connections[index].stream.isSome() {
+                    absorb node.stop(stream, 0)
+                    return true
+                }
+                connections[index].stream = .Some(stream)
+                connections[index].session = server.open()
+                return true
+            }
+            StreamData(data) -> {
+                let index = match connectionIndex(data.stream.connection) {
+                    Some(index) -> index
+                    None -> return false
+                }
+                if !carries(index, data.stream) { return true }
+                received(node, index, data.bytes)
+                return true
+            }
+            StreamEnded(end) -> {
+                let index = match connectionIndex(end.stream.connection) {
+                    Some(index) -> index
+                    None -> return false
+                }
+                if carries(index, end.stream) { endSession(index) }
+                return true
+            }
+        }
+    }
+
+    /// Feeds the bytes of the connection at `index` to its server session.
+    function received(
+        borrow mut self,
+        node: borrow mut QuicNode,
+        index: UNumber,
+        bytes: borrow [UN8]
+    ) {
+        let bodies = match connections[index].reader.feed(bytes) {
+            Ok(bodies) -> bodies
+            Error(failure) -> return fail(node, index, traceText(failure))
+        }
+        for body in bodies {
+            match server.receiveFrame(connections[index].session, copy body) {
+                Ok -> {}
+                Error(failure) -> return fail(node, index, traceText(failure))
+            }
+        }
+    }
+
+    /// Writes what the server gave to the streams, and finishes the streams of ended sessions.
+    function flush(borrow mut self, node: borrow mut QuicNode) {
+        for outgoing in server.take() {
+            let index = match sessionIndex(outgoing.session) {
+                Some(index) -> index
+                None -> continue
+            }
+            let stream = match connections[index].stream {
+                Some(stream) -> stream
+                None -> continue
+            }
+            match node.write(stream, encodeServerMessage(outgoing.message)) {
+                Ok -> {}
+                Error(failure) -> return fail(node, index, traceText(failure))
+            }
+        }
+        for index in 0..connections.count {
+            let session = connections[index].session
+            if session == 0 || !server.ended(session) { continue }
+            match connections[index].stream {
+                Some(stream) -> absorb node.finish(stream)
+                None -> {}
+            }
+            endSession(index)
+        }
+    }
+
+    /// Closes the server session and the connection at `index`, for `reason`.
+    function fail(borrow mut self, node: borrow mut QuicNode, index: UNumber, reason: String) {
+        endSession(index)
+        absorb node.close(connections[index].connection, 1, reason)
+        dropConnection(index)
+    }
+
+    /// Forgets the connection at `index`.
+    function dropConnection(borrow mut self, index: UNumber) {
+        var kept: [HostConnection] = []
+        for (position, held) in connections.enumerated() {
+            if position != index { kept.append(copy held) }
+        }
+        connections = kept
+    }
+
+    /// Ends the session of the connection at `index`, if it has one.
+    function endSession(borrow mut self, index: UNumber) {
+        if connections[index].session == 0 { return }
+        server.close(connections[index].session)
+        connections[index].session = 0
+    }
+
+    /// Whether the connection at `index` carries the stream `stream`.
+    function carries(borrow self, index: UNumber, stream: borrow QuicStreamId) -> Bool {
+        return match connections[index].stream {
+            Some(held) -> held.number == stream.number
+            None -> false
+        }
+    }
+
+    /// The position of the connection `connection`, or `.None` when the host holds none.
+    function connectionIndex(borrow self, connection: QuicConnectionId) -> UNumber? {
+        for (index, held) in connections.enumerated() {
+            if held.connection == connection { return .Some(index) }
+        }
+        return .None
+    }
+
+    /// The position of the connection that carries the session `session`, or `.None` when there is none.
+    function sessionIndex(borrow self, session: Number) -> UNumber? {
+        for (index, held) in connections.enumerated() {
+            if held.session == session { return .Some(index) }
+        }
+        return .None
+    }
+}
+
+/// A host for `server`, listening on `address` with `identity`.
+///
+/// # Failures
+/// The QUIC failure of starting the listener.
+public function hostSync(
+    server: SyncServer,
+    node: borrow mut QuicNode,
+    address: borrow String,
+    identity: QuicIdentity
+) -> Result<SyncHost, QuicFailure> {
+    let listener = try node.listen(address, move identity)
+    return .Ok(SyncHost { server: server, listener: listener })
+}

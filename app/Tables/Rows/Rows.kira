@@ -1,0 +1,45 @@
+//! Rows: checking a row against its table, and the form it is stored in.
+//!
+//! A stored row keeps its fields in column order, without the fields left absent or
+//! set to `Null`. A row is accepted only when every field names a column and has the
+//! column's type, and every required column is present.
+import Foundation
+
+/// The row as stored (SPEC section 7.2): its fields in column order, absent
+/// and `Null` optional fields left out.
+function storedRow(
+    schema: borrow TableSchema,
+    row: borrow Document
+) -> Result<Document, RowProblem> {
+    for (name, value) in row.fields {
+        if !schema.hasColumn(name) { return .Error(.UnknownColumn(copy name)) }
+    }
+    var stored = Document()
+    for column in schema.columns {
+        match row.field(column.name) {
+            Some(value) -> {
+                if value.isNull() {
+                    if !column.optional { return .Error(.MissingColumn(copy column.name)) }
+                    continue
+                }
+                if !hasType(value, column.type) { return .Error(.WrongType(copy column.name)) }
+                stored.fields.append((copy column.name, value))
+            }
+            None -> if !column.optional { return .Error(.MissingColumn(copy column.name)) }
+        }
+    }
+    return .Ok(stored)
+}
+
+/// `row` with every field of `changes` set on it.
+function updatedRow(row: borrow Document, changes: borrow Document) -> Document {
+    var updated = copy row
+    for (name, value) in changes.fields { updated.set(copy name, copy value) }
+    return updated
+}
+
+/// A stored row's bytes, read back.
+function rowOf(bytes: [UN8]) -> Result<Document, TableFailure> {
+    let document = try documentOf(move bytes)
+    return .Ok(document)
+}

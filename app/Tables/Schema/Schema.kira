@@ -1,0 +1,215 @@
+//! Table schemas: the columns, primary key and indexes a table is made of, and the
+//! rules a schema must meet before a table can be created from it (SPEC section 7.1).
+//!
+//! The types are [`ColumnType`], [`Column`], [`IndexSchema`], [`TableSchema`] and
+//! [`Table`]. A schema is checked by its first failing rule, which is reported as a
+//! [`SchemaProblem`].
+import Foundation
+
+/// The type of a column's values (SPEC section 7.1).
+public enum ColumnType {
+    /// A true or false value.
+    Bool
+    /// A number.
+    Number
+    /// A text.
+    Text
+    /// A byte sequence.
+    Bytes
+    /// A list of values. Lists cannot be ordered, so they cannot be keys or indexed.
+    List
+    /// A document of named fields. Documents cannot be ordered, so they cannot be keys or indexed.
+    Document
+}
+
+/// One column of a table: its name, its type and whether a row may leave it out.
+public struct Column {
+    /// The column's name, unique within its table.
+    let name: String
+    /// The type every value in the column has.
+    let type: ColumnType
+    /// Whether a row may leave the column out. Defaults to required.
+    let optional: Bool = false
+}
+
+/// A secondary index over one or more columns of a table.
+public struct IndexSchema {
+    /// The index's name, unique within its table.
+    let name: String
+    /// The indexed columns, in order.
+    let columns: [String]
+    /// Whether two rows may not share the indexed values. Defaults to not unique.
+    let unique: Bool = false
+}
+
+/// The shape of a table: its name, columns, primary key and indexes.
+///
+/// A schema is checked when the table is created, and an invalid one is refused with a `SchemaProblem`.
+public struct TableSchema {
+    /// The table's name, unique within its database.
+    let name: String
+    /// The columns, in declaration order.
+    let columns: [Column]
+    /// The columns whose values identify a row. Required and orderable.
+    let primaryKey: [String]
+    /// The secondary indexes. Defaults to none.
+    let indexes: [IndexSchema] = []
+
+    /// Whether the table has a column named `name`.
+    function hasColumn(borrow self, name: borrow String) -> Bool {
+        for column in columns {
+            if column.name == name { return true }
+        }
+        return false
+    }
+
+    /// The column named `name`, or `.None` when the table has none.
+    function column(borrow self, name: borrow String) -> Column? {
+        for column in columns {
+            if column.name == name { return .Some(copy column) }
+        }
+        return .None
+    }
+}
+
+/// A table that exists in a database: its schema, its catalog id, and the ids of its indexes.
+public struct Table {
+    /// The table's shape.
+    let schema: TableSchema
+    /// The table's id in the catalog.
+    let id: Number
+    /// The catalog ids of the table's indexes, in the order of the schema's indexes.
+    let indexIds: [Number]
+}
+
+/// Why a schema is not valid. The first rule it breaks is the one reported (SPEC section 7.1).
+public enum SchemaProblem {
+    /// The table's name is empty.
+    EmptyName
+    /// Two columns share this name.
+    DuplicateColumn(String)
+    /// The table has no primary key.
+    NoPrimaryKey
+    /// A primary key or index names a column the table does not have. Carries the name.
+    UnknownColumn(String)
+    /// A primary key or index names the same column twice. Carries the name.
+    RepeatedColumn(String)
+    /// A primary key names an optional column. Carries the name.
+    OptionalKeyColumn(String)
+    /// A key or index column has a type with no order. Carries the name.
+    UnorderedColumn(String)
+    /// Two indexes share this name.
+    DuplicateIndex(String)
+    /// An index names no columns. Carries the index's name.
+    EmptyIndex(String)
+}
+
+/// Whether values of the type order (SPEC section 4).
+function isOrderable(columnType: borrow ColumnType) -> Bool {
+    return match columnType {
+        Bool -> true
+        Number -> true
+        Text -> true
+        Bytes -> true
+        List -> false
+        Document -> false
+    }
+}
+
+/// The first rule of SPEC section 7.1 the schema breaks, if any.
+function schemaProblem(schema: borrow TableSchema) -> SchemaProblem? {
+    if schema.name.count == 0 { return .Some(.EmptyName) }
+    var seen: [String] = []
+    for column in schema.columns {
+        if seen.contains(column.name) { return .Some(.DuplicateColumn(copy column.name)) }
+        seen.append(copy column.name)
+    }
+    if schema.primaryKey.count == 0 { return .Some(.NoPrimaryKey) }
+    match keyColumnsProblem(schema, schema.primaryKey, .PrimaryKey) {
+        Some(problem) -> return .Some(problem)
+        // The primary key is valid; the indexes come next.
+        None -> {}
+    }
+    var indexNames: [String] = []
+    for index in schema.indexes {
+        if indexNames.contains(index.name) { return .Some(.DuplicateIndex(copy index.name)) }
+        indexNames.append(copy index.name)
+        if index.columns.count == 0 { return .Some(.EmptyIndex(copy index.name)) }
+        match keyColumnsProblem(schema, index.columns, .Index) {
+            Some(problem) -> return .Some(problem)
+            // This index is valid; the next one is checked.
+            None -> continue
+        }
+    }
+    return .None
+}
+
+/// What a list of key columns orders: the rows themselves, or an index's
+/// entries. Only a primary key refuses optional columns.
+enum KeyColumns {
+    /// The primary key. Its columns must be required.
+    PrimaryKey
+    /// An index. Its columns may be optional.
+    Index
+}
+
+/// What is wrong with a primary key's or an index's columns, if anything.
+function keyColumnsProblem(
+    schema: borrow TableSchema,
+    names: borrow [String],
+    kind: KeyColumns
+) -> SchemaProblem? {
+    var seen: [String] = []
+    for name in names {
+        if seen.contains(name) { return .Some(.RepeatedColumn(copy name)) }
+        seen.append(copy name)
+        match schema.column(name) {
+            Some(column) -> {
+                if kind == .PrimaryKey && column.optional {
+                    return .Some(.OptionalKeyColumn(copy name))
+                }
+                if !isOrderable(column.type) { return .Some(.UnorderedColumn(copy name)) }
+            }
+            None -> return .Some(.UnknownColumn(copy name))
+        }
+    }
+    return .None
+}
+
+/// The case name a column type is stored as (SPEC section 7.3).
+function typeName(columnType: borrow ColumnType) -> String {
+    return match columnType {
+        Bool -> "Bool"
+        Number -> "Number"
+        Text -> "Text"
+        Bytes -> "Bytes"
+        List -> "List"
+        Document -> "Document"
+    }
+}
+
+/// Returns the column type a stored name stands for, or `.None` for an unknown name.
+function typeNamed(name: borrow String) -> ColumnType? {
+    return match name {
+        "Bool" -> .Some(.Bool)
+        "Number" -> .Some(.Number)
+        "Text" -> .Some(.Text)
+        "Bytes" -> .Some(.Bytes)
+        "List" -> .Some(.List)
+        "Document" -> .Some(.Document)
+        else -> .None
+    }
+}
+
+/// Whether `value` is a value of the type; `Null` is of none.
+function hasType(value: borrow Value, columnType: borrow ColumnType) -> Bool {
+    return match value {
+        Null -> false
+        Bool(_) -> code(columnType) == code(ColumnType.Bool)
+        Number(_) -> code(columnType) == code(ColumnType.Number)
+        Text(_) -> code(columnType) == code(ColumnType.Text)
+        Bytes(_) -> code(columnType) == code(ColumnType.Bytes)
+        List(_) -> code(columnType) == code(ColumnType.List)
+        Document(_) -> code(columnType) == code(ColumnType.Document)
+    }
+}

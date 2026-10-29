@@ -1,0 +1,250 @@
+//! The client replica: a local copy of the server's database that the application
+//! reads and writes, and that keeps itself in step with the server (SPEC section 8.5).
+//!
+//! The application subscribes to queries and runs mutations over the local view.
+//! The replica sends the server what must reach it, and applies each transition the
+//! server sends. Mutations are numbered and kept until the server answers them, and
+//! they are sent again on each new session.
+import Foundation
+
+/// What a replica reports (SPEC section 8.5).
+public enum SyncEvent {
+    /// The session started, for the identity the server gave.
+    Welcomed(Value)
+    /// The server refused the session, with the reason.
+    Refused(String)
+    /// The query's result over the view differs from the one last reported. Carries the query's number.
+    Changed(Number)
+    /// A mutation's result arrived.
+    Done(MutationResult)
+}
+
+/// A query the application is subscribed to, and the result last reported for it.
+struct ClientSubscription {
+    /// The number the subscription was given.
+    let query: Number
+    /// The name of the query.
+    let name: String
+    /// The arguments the query runs with.
+    let arguments: Value
+    /// Whether the replica holds every key the query reads.
+    var ready: Bool = false
+    /// The result last reported, as text.
+    var shown: String = ""
+}
+
+/// A mutation sent but not yet answered by the server.
+struct PendingMutation {
+    /// The mutation's number in the client's sequence.
+    let number: Number
+    /// The name of the mutation.
+    let name: String
+    /// The arguments the mutation runs with.
+    let arguments: Value
+}
+
+/// A client's replica of the server's database (SPEC section 8.5).
+///
+/// It takes messages in and gives messages out, and never owns a stream. The application subscribes to queries and runs mutations over its local view; the replica sends whatever must reach the server.
+public struct Replica {
+    /// The replica's local database.
+    var database: Database
+    /// The program's queries and mutations, the same as the server's.
+    let functions: Functions
+    /// Who the replica runs as, once the server has welcomed it.
+    var caller: Caller
+    /// The number the next subscription is given.
+    var nextQuery: Number = 1
+    /// The number the next mutation is given.
+    var nextMutation: Number
+    /// The mutations sent but not yet answered, sent again on each new session.
+    var pending: [PendingMutation]
+    /// The queries the application is subscribed to.
+    var subscriptions: [ClientSubscription] = []
+    /// The key ranges the server has said the replica holds.
+    var held: KeyRanges
+    /// Key ranges that were held before the session ended and may no longer be current.
+    var stale: KeyRanges = KeyRanges()
+    /// Whether a session is open.
+    var connected: Bool = false
+    /// Messages to send to the server, since the last `take`.
+    var outbox: [ClientMessage] = []
+    /// Events for the application, since the last `takeEvents`.
+    var events: [SyncEvent] = []
+
+    /// Subscribes to the query `name` with `arguments`, and answers its number. The query's result becomes ready when the replica holds what it reads.
+    function subscribe(borrow mut self, name: String, arguments: Value) -> Number {
+        let query = nextQuery
+        nextQuery += 1
+        if connected {
+            outbox.append(
+                .Subscribe(Subscribe { query: query, name: copy name, arguments: copy arguments })
+            )
+        }
+        subscriptions.append(ClientSubscription { query: query, name: name, arguments: arguments })
+        reportChanges()
+        return query
+    }
+
+    /// Ends the subscription with this number. Nothing is sent when no session is open.
+    function unsubscribe(borrow mut self, query: Number) {
+        var kept: [ClientSubscription] = []
+        for subscription in subscriptions {
+            if subscription.query != query { kept.append(copy subscription) }
+        }
+        subscriptions = kept
+        if connected { outbox.append(.Unsubscribe(query)) }
+    }
+
+    /// Stores the mutation as pending and runs it over the view; answers its number.
+    ///
+    /// # Failures
+    /// The failure of storing the pending mutation or of running it over the view.
+    function mutate(
+        borrow mut self,
+        name: String,
+        arguments: Value
+    ) -> Result<Number, SyncFailure> {
+        let number = nextMutation
+        var document = Document()
+        document.set("name", .Text(copy name))
+        document.set("arguments", copy arguments)
+        var batch = WriteBatch()
+        batch.put(syncNumberKey("pending", number), encodeValue(.Document(document)))
+        batch.put(syncKey("next-mutation"), encodeValue(.Number(number + 1)))
+        try writeStored(batch)
+        nextMutation = number + 1
+        pending.append(
+            PendingMutation { number: number, name: copy name, arguments: copy arguments }
+        )
+        if connected {
+            outbox.append(.Mutate(Mutate { number: number, name: name, arguments: arguments }))
+        }
+        rebuildView()
+        return .Ok(number)
+    }
+
+    /// The query's result over the view.
+    ///
+    /// # Failures
+    /// `.NoSuchFunction` when the subscription's query is unknown, or the function's own failure.
+    function result(borrow mut self, query: Number) -> Result<Value, FunctionFailure> {
+        for subscription in subscriptions {
+            if subscription.query == query {
+                return viewAnswer(subscription.name, subscription.arguments)
+            }
+        }
+        return .Error(.NoSuchFunction("query \(query)"))
+    }
+
+    /// Whether the replica holds every key the query reads.
+    function ready(borrow self, query: Number) -> Bool {
+        for subscription in subscriptions {
+            if subscription.query == query { return subscription.ready }
+        }
+        return false
+    }
+
+    /// Starts a session with `credentials`: a hello, every subscription and every pending mutation, in that order. Ranges held in the last session are kept as stale until the server confirms them.
+    function connect(borrow mut self, credentials: Value) {
+        connected = true
+        stale = unionOf(stale, held)
+        held = KeyRanges()
+        outbox.append(.Hello(Hello { client: caller.client, credentials: credentials }))
+        for index in 0..subscriptions.count {
+            subscriptions[index].ready = false
+            let subscription = subscriptions[index]
+            outbox.append(
+                .Subscribe(
+                    Subscribe {
+                        query: subscription.query,
+                        name: copy subscription.name,
+                        arguments: copy subscription.arguments
+                    }
+                )
+            )
+        }
+        for mutation in pending {
+            outbox.append(
+                .Mutate(
+                    Mutate {
+                        number: mutation.number,
+                        name: copy mutation.name,
+                        arguments: copy mutation.arguments
+                    }
+                )
+            )
+        }
+    }
+
+    /// Ends the session: nothing is sent until the next `connect`.
+    function disconnect(borrow mut self) {
+        connected = false
+    }
+
+    /// The messages to send since the last `take`.
+    function take(borrow mut self) -> [ClientMessage] {
+        let given = outbox
+        outbox = []
+        return given
+    }
+
+    /// The events since the last `takeEvents`.
+    function takeEvents(borrow mut self) -> [SyncEvent] {
+        let given = events
+        events = []
+        return given
+    }
+
+    /// Reads one frame's body from the session's stream and handles the message in it.
+    ///
+    /// # Failures
+    /// `.Malformed` when the body is not a message, or the failure of applying it.
+    function receiveFrame(borrow mut self, body: [UN8]) -> Result<Void, SyncFailure> {
+        return match decodeServerMessage(move body) {
+            Ok(message) -> receive(message)
+            Error(failure) -> .Error(.Malformed)
+        }
+    }
+
+    /// Handles one message from the server: a welcome, a refusal, or a transition to the next state.
+    ///
+    /// # Failures
+    /// The failure of applying the message to the local database.
+    function receive(borrow mut self, message: borrow ServerMessage) -> Result<Void, SyncFailure> {
+        match message {
+            Welcome(given) -> return welcomed(given)
+            Refused(reason) -> {
+                connected = false
+                events.append(.Refused(copy reason))
+                return .Ok
+            }
+            SyncTransition(transition) -> return apply(transition)
+        }
+    }
+
+    /// Stores the identity and client number the server gave, and rebuilds the view.
+    ///
+    /// # Failures
+    /// The failure of writing the stored state.
+    function welcomed(borrow mut self, given: borrow Caller) -> Result<Void, SyncFailure> {
+        var batch = WriteBatch()
+        batch.put(syncKey("client"), encodeValue(.Number(given.client)))
+        batch.put(syncKey("identity"), encodeValue(given.identity))
+        try writeStored(batch)
+        caller = copy given
+        events.append(.Welcomed(copy given.identity))
+        rebuildView()
+        return .Ok
+    }
+
+    /// Closes the replica's database. The replica must not be used afterwards.
+    ///
+    /// # Failures
+    /// The database failure of closing it.
+    function close(borrow mut self) -> Result<Void, SyncFailure> {
+        database.endRecording()
+        try database.close()
+        return .Ok
+    }
+}

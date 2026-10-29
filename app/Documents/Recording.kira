@@ -1,0 +1,278 @@
+//! Recorded runs: the reads and writes of a transaction-like run, held in memory
+//! until the run ends.
+//!
+//! A recorded run answers reads from what it has already written, records each key
+//! or range it read, and holds its writes instead of making them. When the run
+//! ends, the reads and the held writes are returned, and the caller decides what to
+//! do with them. The three entry points on [`Database`] (read, scan, write) route
+//! through a run when one is active, and otherwise go straight to the store.
+import Foundation
+
+/// Keys from `start` up to, not including, `end`.
+public struct KeyRange {
+    /// The first key in the range, inclusive.
+    let start: [UN8]
+    /// The key the range stops before.
+    let end: [UN8]
+}
+
+// A write a recorded run holds instead of writing: the key's new value, or
+/// A write a recorded run holds instead of applying: a key's new value, or its removal.
+struct HeldWrite {
+    /// The key the write applies to.
+    let key: [UN8]
+    /// The new value, or `.None` for a removal.
+    let value: [UN8]?
+}
+
+/// What a recorded run has read and holds.
+///
+/// A class, so a read through a borrowed database still records.
+class Recording {
+    // Every range the run has read.
+    var reads: [KeyRange]
+    // The held writes, in key order, one per key.
+    var held: [HeldWrite]
+
+    // Records that the run read `range`.
+    function record(borrow mut self, range: KeyRange) {
+        reads.append(range)
+    }
+
+    // Holds `write`, replacing any write already held for the same key.
+    //
+    // The held writes stay in key order.
+    function hold(borrow mut self, write: HeldWrite) {
+        let position = heldPosition(held, write.key)
+        var next: [HeldWrite] = []
+        for index in 0..position { next.append(copy held[index]) }
+        var after = position
+        if position < held.count && held[position].key == write.key { after += 1 }
+        next.append(write)
+        for index in after..held.count { next.append(copy held[index]) }
+        held = next
+    }
+
+    // Replaces the held writes with `mark`, undoing every hold made since `mark` was taken.
+    function restore(borrow mut self, mark: borrow [HeldWrite]) {
+        held = copy mark
+    }
+}
+
+// What a recorded run answers when it ends: the ranges it read and the
+/// What a recorded run returns when it ends: the ranges it read and the writes it held, as one batch.
+struct RecordedRun {
+    /// The ranges the run read.
+    let reads: [KeyRange]
+    /// The held writes, as a batch ready to apply.
+    let batch: WriteBatch
+}
+
+/// Returns the first position in `held` whose key does not order before `key`.
+///
+/// Binary search, so `held` must be in key order.
+function heldPosition(held: borrow [HeldWrite], key: borrow [UN8]) -> UNumber {
+    var low: UNumber = 0
+    var high = held.count
+    while low < high {
+        let middle = low + floor((high - low) / 2)
+        if compareKeys(held[middle].key, key) == .Less {
+            low = middle + 1
+        } else {
+            high = middle
+        }
+    }
+    return low
+}
+
+/// Returns the range that holds only `key`: from `key` up to `key` followed by a zero byte.
+function pointRange(key: borrow [UN8]) -> KeyRange {
+    var end = copy key
+    end.append(0)
+    return KeyRange { start: copy key, end: end }
+}
+
+/// Recording, reading, writing and scanning through a recorded run.
+extend Database {
+    /// Returns the value of `key`, or `.None` when it has none.
+    ///
+    /// Inside a run, the read is recorded and a value the run has held for `key` answers first. Outside a run it is read from the store alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's failure when the read cannot be made.
+    function readKey(borrow self, key: borrow [UN8]) -> Result<[UN8]?, StorageFailure> {
+        match recording {
+            Some(run) -> {
+                var held = run
+                held.record(pointRange(key))
+                let position = heldPosition(held.held, key)
+                if position < held.held.count && held.held[position].key == key {
+                    return .Ok(copy held.held[position].value)
+                }
+            }
+            // An unrecorded read goes to the store alone.
+            None -> {}
+        }
+        return store.get(key)
+    }
+
+    /// Returns the pairs from `start` up to `end`, in key order.
+    ///
+    /// Inside a run, the scanned range is recorded and the held writes in it are merged over the stored pairs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's failure when the scan cannot be made.
+    function scanKeys(
+        borrow self,
+        start: borrow [UN8],
+        end: borrow [UN8]
+    ) -> Result<[KeyValue], StorageFailure> {
+        let stored = try store.scan(start, end)
+        match recording {
+            Some(run) -> {
+                var held = run
+                held.record(KeyRange { start: copy start, end: copy end })
+                return .Ok(withHeld(stored, held.held, start, end))
+            }
+            None -> return .Ok(stored)
+        }
+    }
+
+    /// Applies `batch`.
+    ///
+    /// Inside a run, each write is held instead of applied. Outside a run it is written to the store.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's failure when a write outside a run cannot be applied.
+    function writeBatch(borrow mut self, batch: borrow WriteBatch) -> Result<Void, StorageFailure> {
+        match recording {
+            Some(run) -> {
+                var held = run
+                for write in batch.writes { held.hold(heldWriteOf(write)) }
+                return .Ok
+            }
+            None -> return store.write(batch)
+        }
+    }
+
+    /// Starts a recorded run with nothing read and nothing held.
+    function beginRecording(borrow mut self) {
+        recording = .Some(Recording { reads: [], held: [] })
+    }
+
+    /// Returns the writes the run holds, to roll back to with `rollBack`.
+    ///
+    /// Outside a run there are none.
+    function mark(borrow self) -> [HeldWrite] {
+        return match recording {
+            Some(run) -> copy run.held
+            None -> []
+        }
+    }
+
+    /// Drops every write held since `mark` was taken.
+    function rollBack(borrow mut self, mark: borrow [HeldWrite]) {
+        match recording {
+            Some(run) -> {
+                var held = run
+                held.restore(mark)
+            }
+            // Nothing is held outside a run.
+            None -> {}
+        }
+    }
+
+    /// Drops the ranges the run has read so far. The held writes are kept.
+    function forgetReads(borrow mut self) {
+        match recording {
+            Some(run) -> {
+                var held = run
+                held.reads = []
+            }
+            // Nothing is recorded outside a run.
+            None -> {}
+        }
+    }
+
+    // Ends the run: what it read and holds. The store is read and written
+    /// Ends the run and returns what it read and held.
+    ///
+    /// The store is read and written directly again afterwards. Outside a run this returns an empty run.
+    function endRecording(borrow mut self) -> RecordedRun {
+        let ended = match recording {
+            Some(run) -> RecordedRun { reads: copy run.reads, batch: batchOf(run.held) }
+            None -> RecordedRun { reads: [], batch: WriteBatch() }
+        }
+        recording = .None
+        return ended
+    }
+}
+
+/// Returns the held form of a store write: a put holds its value, a delete holds a removal.
+function heldWriteOf(write: borrow Write) -> HeldWrite {
+    return match write {
+        Put(entry) -> {
+            let (key, value) = entry
+            HeldWrite { key: copy key, value: .Some(copy value) }
+        }
+        Delete(key) -> HeldWrite { key: copy key, value: .None }
+    }
+}
+
+/// Returns the held writes as one batch, puts for values and deletes for removals.
+function batchOf(held: borrow [HeldWrite]) -> WriteBatch {
+    var batch = WriteBatch()
+    for write in held {
+        match write.value {
+            Some(value) -> batch.put(copy write.key, copy value)
+            None -> batch.delete(copy write.key)
+        }
+    }
+    return batch
+}
+
+// The stored pairs from `start` up to `end` with the held writes there over
+/// Returns the stored pairs from `start` up to `end`, with the held writes in that range laid over them, in key order.
+///
+/// A held put replaces a stored pair with the same key, and a held delete removes it.
+function withHeld(
+    stored: borrow [KeyValue],
+    held: borrow [HeldWrite],
+    start: borrow [UN8],
+    end: borrow [UN8]
+) -> [KeyValue] {
+    var merged: [KeyValue] = []
+    var next = heldPosition(held, start)
+    for pair in stored {
+        while next < held.count && compareKeys(held[next].key, pair.key) == .Less {
+            merged.appendHeld(held[next])
+            next += 1
+        }
+        if next < held.count && held[next].key == pair.key {
+            merged.appendHeld(held[next])
+            next += 1
+            continue
+        }
+        merged.append(copy pair)
+    }
+    while next < held.count && compareKeys(held[next].key, end) == .Less {
+        merged.appendHeld(held[next])
+        next += 1
+    }
+    return merged
+}
+
+/// Scan results, with held writes added to them.
+extend Array<KeyValue> {
+    /// Appends a held put as a pair. A held removal adds nothing, which hides the stored key.
+    function appendHeld(borrow mut self, write: borrow HeldWrite) {
+        match write.value {
+            Some(value) -> self.append(KeyValue { key: copy write.key, value: copy value })
+            // A held delete hides the key.
+            None -> {}
+        }
+    }
+}

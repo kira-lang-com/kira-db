@@ -1,0 +1,155 @@
+//! The QUIC transport for sync: a replica's session over one QUIC connection and its stream.
+import Foundation
+
+/// The client end of SPEC section 8.6: a replica's session over QUIC.
+public struct SyncLink {
+    /// The replica whose messages the link carries.
+    var replica: Replica
+    /// The QUIC connection, or `.None` when none is open.
+    var connection: QuicConnectionId? = .None
+    /// The stream the session's messages travel on, or `.None` when no stream is open.
+    var stream: QuicStreamId? = .None
+    /// Reads the frames arriving on the stream.
+    var reader: FrameReader = FrameReader()
+    /// The credentials `connect` gives the server once the connection opens.
+    var offered: Value = .Null
+
+    /// Dials the server; the session starts once the connection opens.
+    ///
+    /// # Failures
+    /// The QUIC failure of dialing.
+    function start(
+        borrow mut self,
+        node: borrow mut QuicNode,
+        dial: QuicDial,
+        credentials: Value
+    ) -> Result<Void, QuicFailure> {
+        match connection {
+            Some(open) -> absorb node.close(open, 0, "")
+            None -> {}
+        }
+        disconnect()
+        let dialed = try node.connect(move dial)
+        connection = .Some(dialed)
+        offered = credentials
+        return .Ok
+    }
+
+    /// Whether a session's stream is open.
+    function connected(borrow self) -> Bool {
+        return stream.isSome()
+    }
+
+    /// Takes `event` when it is the link's own, and sends what the replica gives. Answers whether it was the link's.
+    function event(
+        borrow mut self,
+        node: borrow mut QuicNode,
+        event: borrow QuicNodeEvent
+    ) -> Bool {
+        let own = take(node, event)
+        if own { send(node) }
+        return own
+    }
+
+    /// Takes `event` when it is the link's own, answering whether it was. A stream opened on the link's connection is recorded.
+    function take(borrow mut self, node: borrow mut QuicNode, event: borrow QuicNodeEvent) -> Bool {
+        match event {
+            Opened(opened) -> {
+                if !owns(opened.connection) || opened.listener.isSome() { return false }
+                match node.openStream(opened.connection) {
+                    Ok(opened) -> {
+                        stream = .Some(opened)
+                        reader = FrameReader()
+                        replica.connect(copy offered)
+                    }
+                    Error(failure) -> fail(node, traceText(failure))
+                }
+                return true
+            }
+            Closed(closed) -> {
+                if !owns(closed.connection) { return false }
+                disconnect()
+                return true
+            }
+            StreamOpened(opened) -> return owns(opened.connection)
+            StreamData(data) -> {
+                if !owns(data.stream.connection) { return false }
+                if carries(data.stream) { received(node, data.bytes) }
+                return true
+            }
+            StreamEnded(end) -> {
+                if !owns(end.stream.connection) { return false }
+                if !carries(end.stream) { return true }
+                match connection {
+                    Some(open) -> absorb node.close(open, 0, "")
+                    None -> {}
+                }
+                disconnect()
+                return true
+            }
+        }
+    }
+
+    /// Writes every message the replica gives on the stream; drops them while none is open.
+    function send(borrow mut self, node: borrow mut QuicNode) {
+        let messages = replica.take()
+        let open = match stream {
+            Some(open) -> open
+            None -> return
+        }
+        for message in messages {
+            match node.write(open, encodeClientMessage(message)) {
+                Ok -> {}
+                Error(failure) -> return fail(node, traceText(failure))
+            }
+        }
+    }
+
+    /// Feeds the bytes received on the stream to the replica, one whole frame at a time.
+    function received(borrow mut self, node: borrow mut QuicNode, bytes: borrow [UN8]) {
+        let bodies = match reader.feed(bytes) {
+            Ok(bodies) -> bodies
+            Error(failure) -> return fail(node, traceText(failure))
+        }
+        for body in bodies {
+            match replica.receiveFrame(copy body) {
+                Ok -> {}
+                Error(failure) -> return fail(node, traceText(failure))
+            }
+        }
+    }
+
+    /// Closes the connection with code 1 and `reason`.
+    function fail(borrow mut self, node: borrow mut QuicNode, reason: String) {
+        match connection {
+            Some(open) -> absorb node.close(open, 1, reason)
+            None -> {}
+        }
+        disconnect()
+    }
+
+    /// Ends the session and forgets the stream.
+    function disconnect(borrow mut self) {
+        if stream.isSome() { replica.disconnect() }
+        connection = .None
+        stream = .None
+    }
+
+    /// Whether `given` is the link's connection.
+    function owns(borrow self, given: QuicConnectionId) -> Bool {
+        return connection == .Some(given)
+    }
+
+    /// Whether `given` is the link's stream.
+    function carries(borrow self, given: borrow QuicStreamId) -> Bool {
+        return match stream {
+            Some(open) -> open.number == given.number
+            None -> false
+        }
+    }
+}
+
+/// A link for `replica`, not yet connected.
+public function linkSync(replica: Replica) -> SyncLink {
+    return SyncLink { replica: replica }
+}

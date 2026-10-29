@@ -1,0 +1,160 @@
+//! The catalog: the record of every table, kept in the database itself.
+//!
+//! Each table has a catalog entry under its name, holding its id, columns, primary
+//! key and indexes. The next table id is kept under its own key. Creating a table
+//! writes its catalog entry and the next id in one batch. The layout is SPEC section
+//! 7.3.
+import Foundation
+
+/// The catalog (SPEC section 7.3).
+extend Database {
+    /// Stores a new table with `schema`, giving it and its indexes ids.
+    function createTable(
+        borrow mut self,
+        schema: borrow TableSchema
+    ) -> Result<Table, TableFailure> {
+        match schemaProblem(schema) {
+            Some(problem) -> return .Error(.Schema(problem))
+            // The schema is valid.
+            None -> {}
+        }
+        let existing = try rawGet(catalogKey(schema.name))
+        if existing.isSome() { return .Error(.TableExists(copy schema.name)) }
+        let next = try nextId()
+        var indexIds: [Number] = []
+        for position in 0..schema.indexes.count { indexIds.append(next + 1 + position) }
+        let table = Table { schema: copy schema, id: next, indexIds: indexIds }
+        var batch = WriteBatch()
+        batch.put(catalogKey(schema.name), encodeValue(.Document(catalogDocument(table))))
+        batch.put(nextIdKey(), encodeValue(.Number(next + 1 + schema.indexes.count)))
+        try rawWrite(batch)
+        return .Ok(table)
+    }
+
+    /// The table called `name`.
+    function table(borrow self, name: borrow String) -> Result<Table, TableFailure> {
+        let stored = try rawGet(catalogKey(name))
+        return match stored {
+            Some(bytes) -> catalogTable(name, move bytes)
+            None -> .Error(.NoSuchTable(copy name))
+        }
+    }
+
+    /// Removes the table: its rows, its index entries and its catalog entry.
+    function dropTable(borrow mut self, table: borrow Table) -> Result<Void, TableFailure> {
+        var batch = WriteBatch()
+        var spaces: [[UN8]] = [rowSpace(table)]
+        for id in table.indexIds { spaces.append(indexSpace(id)) }
+        for space in spaces {
+            let pairs = try rawScan(space, pastPrefix(space))
+            for pair in pairs { batch.delete(copy pair.key) }
+        }
+        batch.delete(catalogKey(table.schema.name))
+        return rawWrite(batch)
+    }
+
+    /// The next id the catalog gives: 1 in a database that never gave one.
+    function nextId(borrow self) -> Result<Number, TableFailure> {
+        let stored = try rawGet(nextIdKey())
+        return match stored {
+            Some(bytes) -> storedId(move bytes)
+            None -> .Ok(1)
+        }
+    }
+
+    /// Returns the stored bytes of `key`, or `.None` when there are none.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the read.
+    function rawGet(borrow self, key: borrow [UN8]) -> Result<[UN8]?, TableFailure> {
+        let found = try readKey(key)
+        return .Ok(move found)
+    }
+
+    /// Returns the stored pairs from `start` up to `end`, in key order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the scan.
+    function rawScan(
+        borrow self,
+        start: borrow [UN8],
+        end: borrow [UN8]
+    ) -> Result<[KeyValue], TableFailure> {
+        let pairs = try scanKeys(start, end)
+        return .Ok(move pairs)
+    }
+
+    /// Applies `batch`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the write.
+    function rawWrite(borrow mut self, batch: borrow WriteBatch) -> Result<Void, TableFailure> {
+        try writeBatch(batch)
+        return .Ok
+    }
+}
+
+/// Returns the table a catalog entry describes.
+///
+/// # Errors
+///
+/// Returns `CorruptCatalog` for the table's name when the entry does not read as a table.
+function catalogTable(name: borrow String, bytes: [UN8]) -> Result<Table, TableFailure> {
+    let document = try documentOf(move bytes)
+    return match tableOf(name, document) {
+        Some(table) -> .Ok(table)
+        None -> .Error(.CorruptCatalog(copy name))
+    }
+}
+
+/// Returns the table id stored in `bytes`.
+///
+/// # Errors
+///
+/// Returns `CorruptCatalog` for the next-id key when the stored value is not a number.
+function storedId(bytes: [UN8]) -> Result<Number, TableFailure> {
+    let value = try decodeValue(move bytes)
+    return match value.number() {
+        Some(id) -> .Ok(id)
+        None -> .Error(.CorruptCatalog(TableSpace.nextId))
+    }
+}
+
+/// The catalog document of SPEC section 7.3.
+function catalogDocument(table: borrow Table) -> Document {
+    var columns: [Value] = []
+    for column in table.schema.columns {
+        var described = Document()
+        described.set("name", .Text(copy column.name))
+        let columnType = column.type
+        let typeText = typeName(columnType)
+        described.set("type", .Text(typeText))
+        described.set("optional", .Bool(column.optional))
+        columns.append(.Document(described))
+    }
+    var indexes: [Value] = []
+    for (position, index) in table.schema.indexes.enumerated() {
+        var described = Document()
+        described.set("name", .Text(copy index.name))
+        described.set("id", .Number(table.indexIds[position]))
+        described.set("columns", textList(index.columns))
+        described.set("unique", .Bool(index.unique))
+        indexes.append(.Document(described))
+    }
+    var document = Document()
+    document.set("id", .Number(table.id))
+    document.set("columns", .List(columns))
+    document.set("primaryKey", textList(table.schema.primaryKey))
+    document.set("indexes", .List(indexes))
+    return document
+}
+
+/// Returns `texts` as a list of text values.
+function textList(texts: borrow [String]) -> Value {
+    var values: [Value] = []
+    for text in texts { values.append(.Text(copy text)) }
+    return .List(values)
+}

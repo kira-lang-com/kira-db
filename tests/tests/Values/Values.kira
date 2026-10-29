@@ -1,0 +1,57 @@
+//! Tests for values as the store writes them: scalars and documents read back equal, and a truncated value is refused.
+import Foundation
+import KiraDB
+
+// Values as the store writes them: scalars and documents read back equal to
+// what was written, and a value cut short is refused as truncated.
+
+/// Whether a value encodes and decodes back to the same printed form.
+function valueRoundTrips(value: borrow Value) -> Bool {
+    return match decodeValue(encodeValue(value)) {
+        Ok(decoded) -> traceText(decoded) == traceText(value)
+        Error(failure) -> {
+            log warn("the value did not decode", failure)
+            false
+        }
+    }
+}
+
+@Test
+function nullBooleanAndNumbersRoundTrip() {
+    expect!((valueRoundTrips(.Null)) == (true))
+    expect!((valueRoundTrips(.Bool(true))) == (true))
+    expect!((valueRoundTrips(.Number(-12.375))) == (true))
+    expect!((valueRoundTrips(.Number(18446744073709551615))) == (true))
+}
+
+@Test
+function textAndBytesRoundTrip() {
+    expect!((valueRoundTrips(.Text("héllo"))) == (true))
+    expect!((valueRoundTrips(.Bytes([0, 255, 7]))) == (true))
+}
+
+/// A document keeps its last value for a repeated field, and round-trips.
+@Test
+function documentsRoundTrip() {
+    var document = Document()
+    document.set("name", .Text("Ada"))
+    document.set("tags", .List([.Text("math"), .Number(1843)]))
+    document.set("name", .Text("Ada Lovelace"))
+    expect!((valueRoundTrips(.Document(document))) == (true))
+    let name = match document.textField("name") {
+        Some(text) -> text
+        None -> "missing"
+    }
+    expect!((name) == "Ada Lovelace")
+}
+
+/// A value cut short after its tag is refused, and the failure says so.
+@Test
+function truncatedValueIsRefused() {
+    let bytes = encodeValue(.Text("hello"))
+    let outcome = match decodeValue(bytes.prefix(3)) {
+        Ok(_) -> "decoded"
+        Error(failure) -> traceText(failure)
+    }
+    expect!((outcome) == "DecodeFailure.Truncated(2)")
+}

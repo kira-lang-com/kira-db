@@ -1,0 +1,209 @@
+//! The memory table: the newest writes, kept in a skip list until they are flushed
+//! to a sorted table.
+//!
+//! Entries are ordered by key ascending, then by sequence descending, so the newest
+//! version of a key comes first. Nodes live in one array and link to each other by
+//! index. Heights are chosen with a fixed pseudo-random generator, so the shape of
+//! the list is the same for the same sequence of inserts.
+import Foundation
+
+/// What a key holds at one sequence (SPEC section 5.1).
+enum Version {
+    /// A value written for the key.
+    Put([UN8])
+    /// The key was removed.
+    Delete
+}
+
+/// One version of one key, as the memory table and sorted tables order them.
+struct Entry {
+    /// The key.
+    let key: [UN8]
+    /// The sequence number the write was made at.
+    let sequence: UNumber
+    /// What the key holds at that sequence.
+    let version: Version
+}
+
+/// The index of a node in a memory table's node array.
+distinct NodeIndex = UNumber
+
+/// A node of the skip list: its entry, and the next node at each of its levels.
+struct SkipNode {
+    /// The entry the node holds.
+    let entry: Entry
+    /// The next node at each level, or `.None` at the end of that level.
+    var next: [NodeIndex?]
+}
+
+/// The constants of the skip list.
+namespace SkipList {
+    /// Enough levels for billions of entries at one node in four per level.
+    let levels: UNumber = 16
+    /// One node in `branching` rises a level.
+    let branching: UNumber = 4
+    /// The index of the head node, which holds no entry.
+    let headNode: UNumber = 0
+    /// Park and Miller's minimal standard generator: a multiplier and a prime
+    /// modulus whose products stay exact in a word.
+    let multiplier: UNumber = 48271
+    /// The prime modulus of the pseudo-random generator.
+    let modulus: UNumber = 2147483647
+    /// Bytes counted for each entry besides its key and value: its sequence,
+    /// kind and links.
+    let entryOverhead: UNumber = 32
+}
+
+/// SPEC section 5.4: versions ordered by key ascending, then sequence
+/// descending, in a skip list whose nodes live in one array.
+struct MemoryTable {
+    /// The nodes: the head node first, then one node for each inserted entry.
+    var nodes: [SkipNode] = [SkipNode {
+        entry: Entry { key: [], sequence: 0, version: .Delete },
+        next: headLinks()
+    }]
+    /// The number of levels in use.
+    var height: UNumber = 1
+    /// The bytes the table holds, counted for each entry by its key, value and overhead.
+    var bytes: UNumber = 0
+    /// The state of the pseudo-random generator.
+    var seed: UNumber = 1
+
+    /// Adds `entry` to the table.
+    ///
+    /// Its level is drawn from the pseudo-random generator, and it is linked in at every level it has.
+    function insert(borrow mut self, entry: Entry) {
+        bytes += entry.key.count + versionBytes(entry.version) + SkipList.entryOverhead
+        let preceding = predecessors(entry.key, entry.sequence)
+        let levels = randomHeight()
+        let index = NodeIndex(nodes.count)
+        var next: [NodeIndex?] = []
+        for level in 0..levels { next.append(nodes[preceding[level].raw].next[level]) }
+        nodes.append(SkipNode { entry: entry, next: next })
+        for level in 0..levels { nodes[preceding[level].raw].next[level] = .Some(index) }
+        if levels > height { height = levels }
+    }
+
+    /// The newest version of `key` at or below `snapshot`, if any.
+    function find(borrow self, key: borrow [UN8], snapshot: UNumber) -> Version? {
+        let preceding = predecessors(key, snapshot)
+        return match nodes[preceding[0].raw].next[0] {
+            Some(found) -> {
+                let entry = nodes[found.raw].entry
+                match compareKeys(entry.key, key) {
+                    Equal -> .Some(entry.version)
+                    Less -> .None
+                    Greater -> .None
+                }
+            }
+            None -> .None
+        }
+    }
+
+    /// Every entry, in order.
+    function entries(borrow self) -> [Entry] {
+        var ordered: [Entry] = []
+        var current = nodes[SkipList.headNode].next[0]
+        while true {
+            match current {
+                Some(index) -> {
+                    ordered.append(nodes[index.raw].entry)
+                    current = nodes[index.raw].next[0]
+                }
+                None -> return ordered
+            }
+        }
+    }
+
+    /// The entries whose keys lie from `start` up to, not including, `end`,
+    /// leaving out `start`'s versions newer than `snapshot`.
+    function entriesIn(
+        borrow self,
+        start: borrow [UN8],
+        end: borrow [UN8],
+        snapshot: UNumber
+    ) -> [Entry] {
+        var found: [Entry] = []
+        var current = nodes[predecessors(start, snapshot)[0].raw].next[0]
+        while true {
+            match current {
+                Some(index) -> {
+                    if compareKeys(nodes[index.raw].entry.key, end) != .Less { return found }
+                    found.append(nodes[index.raw].entry)
+                    current = nodes[index.raw].next[0]
+                }
+                None -> return found
+            }
+        }
+    }
+
+    /// At each level, the last node ordered before `(key, sequence)`.
+    function predecessors(borrow self, key: borrow [UN8], sequence: UNumber) -> [NodeIndex] {
+        var preceding: [NodeIndex] = []
+        for _ in 0..SkipList.levels { preceding.append(NodeIndex(SkipList.headNode)) }
+        var current = NodeIndex(SkipList.headNode)
+        for step in 0..height {
+            let level = height - 1 - step
+            current = lastBefore(current, level, key, sequence)
+            preceding[level] = current
+        }
+        return preceding
+    }
+
+    /// From `start`, the last node at `level` ordered before `(key, sequence)`.
+    function lastBefore(
+        borrow self,
+        start: NodeIndex,
+        level: UNumber,
+        key: borrow [UN8],
+        sequence: UNumber
+    ) -> NodeIndex {
+        var current = start
+        while true {
+            match nodes[current.raw].next[level] {
+                Some(next) -> {
+                    if !nodes[next.raw].entry.orderedBefore(key, sequence) { return current }
+                    current = next
+                }
+                None -> return current
+            }
+        }
+    }
+
+    /// One level, then one more with probability one in `branching` each.
+    function randomHeight(borrow mut self) -> UNumber {
+        for levels in 1..SkipList.levels {
+            seed = seed * SkipList.multiplier % SkipList.modulus
+            if seed % SkipList.branching != 0 { return levels }
+        }
+        return SkipList.levels
+    }
+}
+
+/// Ordering of entries.
+extend Entry {
+    /// Whether this entry orders before `(key, sequence)`: a smaller key, or
+    /// the same key at a newer sequence.
+    function orderedBefore(borrow self, key: borrow [UN8], sequence: UNumber) -> Bool {
+        return match compareKeys(self.key, key) {
+            Less -> true
+            Equal -> self.sequence > sequence
+            Greater -> false
+        }
+    }
+}
+
+/// Returns the links of the head node: none at every level.
+function headLinks() -> [NodeIndex?] {
+    var links: [NodeIndex?] = []
+    for _ in 0..SkipList.levels { links.append(.None) }
+    return links
+}
+
+/// Returns the bytes of a version's value, or zero for a removal.
+function versionBytes(version: borrow Version) -> UNumber {
+    return match version {
+        Put(value) -> value.count
+        Delete -> 0
+    }
+}

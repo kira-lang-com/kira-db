@@ -1,0 +1,53 @@
+//! The data blocks a store keeps in memory after a point read has checked them.
+//!
+//! A kept block lets a repeated read of the same block skip the file. The kept
+//! blocks sit in a fixed number of places, shared by every table, and a new block
+//! takes its place over an older one.
+import Foundation
+
+/// A data block a point read checked: the table it is from and its number
+/// there.
+struct KeptBlock {
+    /// The number of the table the block is from.
+    let table: UNumber
+    /// The block's number within its table.
+    let number: UNumber
+    /// The block's bytes.
+    let bytes: [UN8]
+}
+
+/// The data blocks a store keeps (SPEC section 5.5). A class, so a read
+/// through a borrowed store still keeps what it read.
+class KeptBlocks {
+    // The kept blocks, by place.
+    var places: [KeptBlock?] = []
+
+    // The kept block `number` of `table`, if its place holds it.
+    function kept(borrow self, table: UNumber, number: UNumber) -> KeptBlock? {
+        let place = keptPlace(table, number)
+        if place >= places.count { return .None }
+        return match places[place] {
+            Some(block) -> block.table == table && block.number == number ? .Some(block) : .None
+            None -> .None
+        }
+    }
+
+    // Keeps `block` in its place, replacing the block there.
+    function keep(borrow mut self, block: KeptBlock) {
+        let place = keptPlace(block.table, block.number)
+        while places.count <= place { places.append(.None) }
+        places[place] = .Some(block)
+    }
+}
+
+/// Where block `number` of `table` is kept: tables' blocks start apart, so
+/// two tables' first blocks do not take each other's place.
+function keptPlace(table: UNumber, number: UNumber) -> UNumber {
+    return (number + table * KeptPlaces.tableStride) % Tuning.cachedBlocks
+}
+
+/// The layout of the kept places.
+namespace KeptPlaces {
+    /// How far apart the places of consecutive tables start.
+    let tableStride: UNumber = 61
+}

@@ -1,0 +1,9 @@
+//! Comparing encoded keys.
+//!
+//! Keys compare byte by byte, which is the order of the values they encode.
+import Foundation
+
+/// The order of two encoded keys: byte by byte, so a key that is a prefix of another orders first (SPEC section 4).
+public function compareKeys(left: borrow [UN8], right: borrow [UN8]) -> Ordering {
+    return compare(left, right)
+}

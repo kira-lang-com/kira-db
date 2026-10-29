@@ -1,0 +1,205 @@
+//! Query plans: which source a query reads its rows from, and the key range it
+//! reads there.
+//!
+//! A plan names the primary key or one of the table's indexes, and the start and
+//! end of the key range to scan under it. The planner takes the source whose
+//! leading columns the query fixes most tightly. See SPEC section 7.6.
+import Foundation
+
+/// Where a query reads its rows from (SPEC section 7.6).
+enum Source {
+    PrimaryKey
+    /// The index at this position in the table's schema.
+    Index(UNumber)
+}
+
+/// A source and the keys from `start` up to, not including, `end` it reads.
+struct Plan {
+    /// The source the plan reads.
+    let source: Source
+    /// The first key read, inclusive.
+    let start: [UN8]
+    /// The key the read stops before.
+    let end: [UN8]
+}
+
+/// What a query's top-level comparisons say about a list of key columns: the
+/// values `Equal` fixes the leading ones to, then the range on the next one.
+struct KeyBound {
+    /// The values the leading columns are fixed to.
+    var fixed: [Value] = []
+    /// The comparison that bounds the range from below, or `.None`.
+    var lower: Comparison? = .None
+    /// The comparison that bounds the range from above, or `.None`.
+    var upper: Comparison? = .None
+
+    /// Returns whether the bound has a range on the column after the fixed ones.
+    function hasRange(borrow self) -> Bool {
+        return lower.isSome() || upper.isSome()
+    }
+
+    /// Whether this bound narrows more than `other`: more columns fixed, or
+    /// as many and a range besides.
+    function narrowerThan(borrow self, other: borrow KeyBound) -> Bool {
+        if fixed.count != other.fixed.count { return fixed.count > other.fixed.count }
+        return hasRange() && !other.hasRange()
+    }
+}
+
+/// Returns the bound the top-level `conditions` place on `columns`.
+///
+/// The columns are fixed by `Equal` comparisons in order. The first column without one takes the range comparisons on it.
+function boundOver(columns: borrow [String], conditions: borrow [Condition]) -> KeyBound {
+    var bound = KeyBound()
+    for name in columns {
+        match equalValue(conditions, name) {
+            Some(value) -> bound.fixed.append(value)
+            None -> {
+                bound.lower = rangeEnd(conditions, name, .Lower)
+                bound.upper = rangeEnd(conditions, name, .Upper)
+                return bound
+            }
+        }
+    }
+    return bound
+}
+
+/// The value a top-level `Equal` comparison fixes the column to, if one does.
+function equalValue(conditions: borrow [Condition], name: borrow String) -> Value? {
+    for condition in conditions {
+        match condition {
+            Compare(comparison) -> match comparison.relation {
+                Equal -> if comparison.column == name { return .Some(copy comparison.value) }
+                NotEqual -> continue
+                Less -> continue
+                LessOrEqual -> continue
+                Greater -> continue
+                GreaterOrEqual -> continue
+            }
+            IsNull(_) -> continue
+            AllOf(_) -> continue
+            AnyOf(_) -> continue
+        }
+    }
+    return .None
+}
+
+/// The side of a range a comparison bounds.
+enum RangeEnd {
+    /// The lower end of the range.
+    Lower
+    /// The upper end of the range.
+    Upper
+}
+
+/// The first top-level comparison bounding the column on `end`, if any.
+function rangeEnd(
+    conditions: borrow [Condition],
+    name: borrow String,
+    end: RangeEnd
+) -> Comparison? {
+    for condition in conditions {
+        match condition {
+            Compare(comparison) -> {
+                if comparison.column == name && boundsEnd(comparison.relation, end) {
+                    return .Some(copy comparison)
+                }
+            }
+            IsNull(_) -> continue
+            AllOf(_) -> continue
+            AnyOf(_) -> continue
+        }
+    }
+    return .None
+}
+
+/// Whether the range end `end` is the end that `relation` bounds.
+///
+/// An upper end bounds `Less` and `LessOrEqual`; a lower end bounds `Greater` and `GreaterOrEqual`. `Equal`
+/// and `NotEqual` bound no end, so they answer `false`.
+function boundsEnd(relation: borrow Relation, end: borrow RangeEnd) -> Bool {
+    return match relation {
+        Less -> isUpper(end)
+        LessOrEqual -> isUpper(end)
+        Greater -> !isUpper(end)
+        GreaterOrEqual -> !isUpper(end)
+        Equal -> false
+        NotEqual -> false
+    }
+}
+
+/// Whether `end` is the upper end of a range.
+function isUpper(end: borrow RangeEnd) -> Bool {
+    return match end {
+        Lower -> false
+        Upper -> true
+    }
+}
+
+/// The plan SPEC section 7.6 picks for the query.
+function planOf(query: borrow Query) -> Result<Plan, TableFailure> {
+    let table = query.table
+    var source: Source = .PrimaryKey
+    var best = boundOver(table.schema.primaryKey, query.conditions)
+    for (position, index) in table.schema.indexes.enumerated() {
+        let bound = boundOver(index.columns, query.conditions)
+        if bound.fixed.count > 0 && bound.narrowerThan(best) {
+            source = .Index(position)
+            best = bound
+        }
+    }
+    let space = match source {
+        PrimaryKey -> rowSpace(table)
+        Index(position) -> indexSpace(table.indexIds[position])
+    }
+    return boundPlan(move source, space, best)
+}
+
+/// The plan reading `source` over the keys a bound takes in, under `space`.
+function boundPlan(
+    source: Source,
+    space: borrow [UN8],
+    bound: borrow KeyBound
+) -> Result<Plan, TableFailure> {
+    var prefix = copy space
+    try prefix.appendValues(bound.fixed)
+    var start = copy prefix
+    match bound.lower {
+        Some(lower) -> try start.appendRangeEnd(lower)
+        // With no lower end the scan starts at the prefix.
+        None -> {}
+    }
+    var end = pastPrefix(prefix)
+    match bound.upper {
+        Some(upper) -> {
+            end = copy prefix
+            try end.appendRangeEnd(upper)
+        }
+        // With no upper end the scan runs past every key under the prefix.
+        None -> {}
+    }
+    return .Ok(Plan { source: source, start: start, end: end })
+}
+
+extend Array<UN8> {
+    /// The comparison's value; then, where the range takes in no key that
+    /// starts with it (`Greater`) or every one (`LessOrEqual`), the byte
+    /// past them all.
+    function appendRangeEnd(
+        borrow mut self,
+        comparison: borrow Comparison
+    ) -> Result<Void, TableFailure> {
+        try appendValues([copy comparison.value])
+        match comparison.relation {
+            Greater -> self.append(KeyEscape.largestByte)
+            LessOrEqual -> self.append(KeyEscape.largestByte)
+            // The range starts at keys holding the value, or stops before them.
+            GreaterOrEqual -> {}
+            Less -> {}
+            // Never a range end: `rangeEnd` takes only range relations.
+            Equal -> {}
+            NotEqual -> {}
+        }
+        return .Ok
+    }
+}

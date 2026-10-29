@@ -1,0 +1,8 @@
+//! The KiraDB test package, run against the library in the parent directory.
+construct KiraDBTests extends Package {
+    let version: String = "0.1.0"
+    let kind: PackageKind = .App
+    let dependencies: [Dependency] = [
+        Dependency { name: "KiraDB", path: ".." }
+    ]
+}

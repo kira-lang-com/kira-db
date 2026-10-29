@@ -1,0 +1,184 @@
+//! Reading encoded keys back into the values they were made from.
+//!
+//! The inverse of the key encoding in `KeyEncoding.kira` (SPEC section 4). A number
+//! key is decoded from its exponent and digits: when the digits and exponent fit a
+//! word the number is worked out from them exactly, and otherwise it is read from
+//! its decimal text.
+import Foundation
+
+/// The sign of a number key's body: a negative number's bytes are
+/// complemented.
+enum NumberSign {
+    /// A zero or positive number.
+    Positive
+    /// A negative number.
+    Negative
+}
+
+/// The values a key was encoded from (SPEC section 4, read back).
+///
+/// # Failures
+/// A `DecodeFailure` when the key's bytes do not read as values.
+public function decodeKey(bytes: [UN8]) -> Result<[Value], DecodeFailure> {
+    var cursor = ByteCursor { bytes: bytes }
+    var values: [Value] = []
+    while !cursor.atEnd() {
+        let value = try cursor.readKeyPart()
+        values.append(value)
+    }
+    return .Ok(values)
+}
+
+/// The one value a key holds from `start` to its end.
+function decodeLastKeyPart(bytes: borrow [UN8], start: UNumber) -> Result<Value, DecodeFailure> {
+    var cursor = ByteCursor { bytes: copy bytes, offset: start }
+    let value = try cursor.readKeyPart()
+    if !cursor.atEnd() { return .Error(.TrailingBytes(cursor.offset)) }
+    return .Ok(value)
+}
+
+/// Reading key parts from bytes.
+extend ByteCursor {
+    /// Reads one key part: its tag, then its contents.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownTag` at the tag's offset for a tag no key part uses, and the failure of reading the contents.
+    function readKeyPart(borrow mut self) -> Result<Value, DecodeFailure> {
+        let at = offset
+        let tag = try readByte()
+        return match fromCode<KeyTag>(tag) {
+            Null -> .Ok(.Null)
+            False -> .Ok(.Bool(false))
+            True -> .Ok(.Bool(true))
+            Zero -> .Ok(.Number(0))
+            Positive -> readNumberKey(.Positive)
+            Negative -> readNumberKey(.Negative)
+            Bytes -> readBytesKey()
+            Text -> readTextKey()
+            else -> .Error(.UnknownTag(at))
+        }
+    }
+
+    /// Reads an escaped byte key part.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode failure when the escaping is malformed.
+    function readBytesKey(borrow mut self) -> Result<Value, DecodeFailure> {
+        let read = try readEscaped()
+        return .Ok(.Bytes(read))
+    }
+
+    /// Reads an escaped text key part.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidText` at the part's start when its bytes are not UTF-8, and a decode failure when the escaping is malformed.
+    function readTextKey(borrow mut self) -> Result<Value, DecodeFailure> {
+        let at = offset
+        let read = try readEscaped()
+        return match textFromBytes(read) {
+            Some(text) -> .Ok(.Text(text))
+            None -> .Error(.InvalidText(at))
+        }
+    }
+
+    /// Escaped bytes up to and past their terminator.
+    function readEscaped(borrow mut self) -> Result<[UN8], DecodeFailure> {
+        var read: [UN8] = []
+        while true {
+            let byte = try readByte()
+            if byte != KeyEscape.zero {
+                read.append(byte)
+                continue
+            }
+            let at = offset
+            let next = try readByte()
+            if next == KeyEscape.terminator { return .Ok(read) }
+            if next != KeyEscape.escapedZero { return .Error(.UnknownTag(at)) }
+            read.append(KeyEscape.zero)
+        }
+        return .Ok(read)
+    }
+
+    /// A number's body: its exponent, at least one digit, then the end byte.
+    function readNumberKey(borrow mut self, sign: NumberSign) -> Result<Value, DecodeFailure> {
+        let at = offset
+        var body: [UN8] = []
+        while true {
+            let byte = try readByte()
+            let plain = match sign {
+                Positive -> byte
+                Negative -> KeyEscape.largestByte - byte
+            }
+            if body.count >= KeyEscape.exponentBytes && plain == KeyEscape.digitEnd { break }
+            body.append(plain)
+        }
+        if body.count <= KeyEscape.exponentBytes { return .Error(.InvalidNumber(at)) }
+        let exponent = Number(body[0]) * KeyEscape.byteRange + Number(body[1])
+            - KeyEscape.exponentBias
+        return match magnitudeOf(body, exponent) {
+            Some(magnitude) -> .Ok(.Number(signed(magnitude, sign)))
+            None -> .Error(.InvalidNumber(at))
+        }
+    }
+}
+
+/// Digits a whole or fractional part may have and still be worked out
+/// exactly in one word.
+namespace NumberDigits {
+    /// The most digits, and the most exponent, a number is worked out from its digits for.
+    let exact: UNumber = 18
+    /// The base the digits are read in.
+    let base: Number = 10
+}
+
+/// The magnitude `0.d1 d2 ... dn x 10^exponent` of a number key's body. One
+/// whose digits and exponent fit a word is computed from its digits; any
+/// other is read back from its decimal text.
+function magnitudeOf(body: borrow [UN8], exponent: Number) -> Number? {
+    let digitCount = body.count - KeyEscape.exponentBytes
+    let fits = digitCount <= NumberDigits.exact && exponent <= NumberDigits.exact
+        && digitCount - exponent <= NumberDigits.exact
+    if !fits { return parseNumber(numberText(body, exponent)) }
+    var mantissa: Number = 0
+    for index in KeyEscape.exponentBytes..body.count {
+        mantissa = mantissa * NumberDigits.base + Number(body[index] - KeyEscape.digitOffset)
+    }
+    var scale: Number = 1
+    if exponent >= digitCount {
+        for _ in digitCount..exponent { scale = scale * NumberDigits.base }
+        return .Some(mantissa * scale)
+    }
+    for _ in exponent..digitCount { scale = scale * NumberDigits.base }
+    return .Some(mantissa / scale)
+}
+
+/// Returns `magnitude`, negated for a negative sign.
+function signed(magnitude: Number, sign: borrow NumberSign) -> Number {
+    return match sign {
+        Positive -> magnitude
+        Negative -> -magnitude
+    }
+}
+
+/// The decimal text of `0.d1 d2 ... dn x 10^exponent`, its digits written
+/// `digit + 1` after the exponent bytes.
+function numberText(body: borrow [UN8], exponent: Number) -> String {
+    var digits = ""
+    for index in KeyEscape.exponentBytes..body.count {
+        digits = digits + String(body[index] - KeyEscape.digitOffset)
+    }
+    if exponent >= digits.count {
+        var text = digits
+        for _ in digits.count..exponent { text = text + "0" }
+        return text
+    }
+    if exponent > 0 {
+        return digits.substring(0, exponent) + "." + digits.substring(exponent, digits.count)
+    }
+    var text = "0."
+    for _ in exponent..0 { text = text + "0" }
+    return text + digits
+}

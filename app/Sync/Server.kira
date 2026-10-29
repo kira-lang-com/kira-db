@@ -1,0 +1,290 @@
+//! The sync server: the side of the protocol that owns the database.
+//!
+//! A session is one stream from a client. It says `hello` with its credentials, is
+//! welcomed with a client number, then subscribes to queries and sends mutations. The
+//! server runs each mutation once, in order by its number, and sends every session a
+//! transition as the database changes (SPEC sections 8.4 and 8.6).
+import Foundation
+
+/// A message the server gives a session.
+public struct Outgoing {
+    /// The session the message is for.
+    let session: Number
+    /// The message to send.
+    let message: ServerMessage
+}
+
+/// A subscription and the ranges its last run read.
+struct ServerSubscription {
+    /// The number the client gave the subscription.
+    let query: Number
+    /// The name of the query the subscription runs.
+    let name: String
+    /// The arguments the query runs with.
+    let arguments: Value
+    /// The key ranges the last run of the query read.
+    var reads: KeyRanges
+    /// Whether the client has been told the subscription's first result.
+    var ready: Bool = false
+}
+
+/// The server's state for one session.
+struct ServerSession {
+    /// The session's number.
+    let id: Number
+    /// Set by `hello`.
+    var caller: Caller? = .None
+    var subscriptions: [ServerSubscription] = []
+    /// The key ranges the session holds, which are the ranges its subscriptions read.
+    var held: KeyRanges = KeyRanges()
+    /// Whether the session has ended and its stream should close.
+    var ended: Bool = false
+}
+
+/// The sync server of SPEC section 8.4. It takes messages in and gives messages out, and never owns a stream (section 8.6).
+///
+/// Sessions are opened with `open` and closed with `close`. Each session says `hello` first, then subscribes and mutates.
+public struct SyncServer {
+    /// The server's database.
+    var database: Database
+    /// The program's queries and mutations.
+    let functions: Functions
+    /// Answers the identity for a client's credentials, or the reason they are refused.
+    let authenticate: (borrow Value) -> Result<Value, String>
+    /// The open sessions.
+    var sessions: [ServerSession] = []
+    /// The number the next session is given.
+    var nextSession: Number = 1
+    /// Messages to give the sessions, since the last `take`.
+    var outbox: [Outgoing] = []
+
+    /// Opens a session for a new stream and answers its number.
+    function open(borrow mut self) -> Number {
+        let id = nextSession
+        nextSession += 1
+        sessions.append(ServerSession { id: id })
+        return id
+    }
+
+    /// Forgets the session: its stream is gone.
+    function close(borrow mut self, session: Number) {
+        var kept: [ServerSession] = []
+        for open in sessions {
+            if open.id != session { kept.append(copy open) }
+        }
+        sessions = kept
+    }
+
+    /// Whether the session has ended: its stream should close once what was sent to it is delivered.
+    function ended(borrow self, session: Number) -> Bool {
+        for open in sessions {
+            if open.id == session { return open.ended }
+        }
+        return true
+    }
+
+    /// The messages given since the last `take`.
+    function take(borrow mut self) -> [Outgoing] {
+        let given = outbox
+        outbox = []
+        return given
+    }
+
+    /// A frame's body from the session's stream.
+    ///
+    /// # Failures
+    /// The failure of decoding the frame, or of handling its message.
+    function receiveFrame(
+        borrow mut self,
+        session: Number,
+        body: [UN8]
+    ) -> Result<Void, SyncFailure> {
+        match decodeClientMessage(move body) {
+            Ok(message) -> return receive(session, message)
+            Error(failure) -> {
+                refuse(session, "malformed message")
+                return .Ok
+            }
+        }
+    }
+
+    /// Handles one message from the client in session `session`.
+    ///
+    /// # Failures
+    /// The failure of the function or the store the message reaches.
+    function receive(
+        borrow mut self,
+        session: Number,
+        message: borrow ClientMessage
+    ) -> Result<Void, SyncFailure> {
+        let position = match positionOf(session) {
+            Some(position) -> position
+            None -> return .Ok
+        }
+        if sessions[position].ended { return .Ok }
+        return match message {
+            Hello(hello) -> greet(position, hello)
+            Subscribe(subscribe) -> match openedCaller(position) {
+                Some(caller) -> subscribeTo(position, caller, subscribe)
+                None -> .Ok
+            }
+            Unsubscribe(query) -> match openedCaller(position) {
+                Some(_) -> unsubscribeFrom(position, query)
+                None -> .Ok
+            }
+            Mutate(mutate) -> match openedCaller(position) {
+                Some(caller) -> runMutate(position, caller, mutate)
+                None -> .Ok
+            }
+        }
+    }
+
+    /// The caller of the session at `position`. A session that `hello` has not opened is refused with "malformed message", and answers none.
+    function openedCaller(borrow mut self, position: UNumber) -> Caller? {
+        let caller = sessions[position].caller
+        if caller.isNone() { refuse(sessions[position].id, "malformed message") }
+        return caller
+    }
+
+    /// The position of the open session with this number, or `.None` when there is none.
+    function positionOf(borrow self, session: Number) -> UNumber? {
+        for (position, open) in sessions.enumerated() {
+            if open.id == session { return .Some(position) }
+        }
+        return .None
+    }
+
+    /// Refuses the session `session` with `reason` and ends it once the refusal is sent.
+    function refuse(borrow mut self, session: Number, reason: String) {
+        outbox.append(Outgoing { session: session, message: .Refused(move reason) })
+        match positionOf(session) {
+            Some(position) -> sessions[position].ended = true
+            // A closed session has no stream to end.
+            None -> {}
+        }
+    }
+
+    /// Answers a `hello`: the server authenticates the credentials and welcomes the session. A session that is already welcomed is refused.
+    ///
+    /// # Failures
+    /// The failure of storing the session's state.
+    function greet(
+        borrow mut self,
+        position: UNumber,
+        hello: borrow Hello
+    ) -> Result<Void, SyncFailure> {
+        let id = sessions[position].id
+        if sessions[position].caller.isSome() {
+            refuse(id, "malformed message")
+            return .Ok
+        }
+        let identity = match authenticate(hello.credentials) {
+            Ok(identity) -> identity
+            Error(reason) -> {
+                refuse(id, move reason)
+                return .Ok
+            }
+        }
+        var client = hello.client
+        if client == 0 {
+            let key = syncKey("next-client")
+            client = try database.storedNumber(key, 1)
+            var batch = WriteBatch()
+            batch.put(move key, encodeValue(.Number(client + 1)))
+            try database.writeBatch(batch)
+        }
+        let caller = Caller { client: client, identity: identity }
+        sessions[position].caller = .Some(copy caller)
+        outbox.append(Outgoing { session: id, message: .Welcome(caller) })
+        return .Ok
+    }
+
+    /// Runs the subscription's query for the caller, replaces any earlier subscription with the same number, and sends the transition with its result.
+    ///
+    /// # Failures
+    /// The failure of running the query or of sending the transition.
+    function subscribeTo(
+        borrow mut self,
+        position: UNumber,
+        caller: borrow Caller,
+        subscribe: borrow Subscribe
+    ) -> Result<Void, SyncFailure> {
+        let run = database.runQuery(functions, subscribe.name, caller, subscribe.arguments)
+        var kept: [ServerSubscription] = []
+        for subscription in sessions[position].subscriptions {
+            if subscription.query != subscribe.query { kept.append(copy subscription) }
+        }
+        kept.append(
+            ServerSubscription {
+                query: subscribe.query,
+                name: copy subscribe.name,
+                arguments: copy subscribe.arguments,
+                reads: run.reads
+            }
+        )
+        sessions[position].subscriptions = kept
+        return sendTransition(position, [], [])
+    }
+
+    /// Ends the subscription with this number and sends the transition for it.
+    ///
+    /// # Failures
+    /// The failure of sending the transition.
+    function unsubscribeFrom(
+        borrow mut self,
+        position: UNumber,
+        query: Number
+    ) -> Result<Void, SyncFailure> {
+        var kept: [ServerSubscription] = []
+        for subscription in sessions[position].subscriptions {
+            if subscription.query != query { kept.append(copy subscription) }
+        }
+        sessions[position].subscriptions = kept
+        return sendTransition(position, [], [])
+    }
+
+    /// Runs a mutation the client sent, once. A mutation already applied is answered as skipped; one that skips a number is refused.
+    ///
+    /// # Failures
+    /// The failure of running the mutation or of storing its result.
+    function runMutate(
+        borrow mut self,
+        position: UNumber,
+        caller: borrow Caller,
+        mutate: borrow Mutate
+    ) -> Result<Void, SyncFailure> {
+        let key = syncNumberKey("applied", caller.client)
+        let applied = try database.storedNumber(key, 0)
+        if mutate.number <= applied {
+            let skipped = MutationResult { number: mutate.number, outcome: .Skipped }
+            return sendTransition(position, [], [skipped])
+        }
+        if mutate.number > applied + 1 {
+            refuse(sessions[position].id, "mutation out of order")
+            return .Ok
+        }
+        let run = database.runMutation(functions, mutate.name, caller, mutate.arguments)
+        var batch = run.batch
+        batch.put(move key, encodeValue(.Number(mutate.number)))
+        try database.writeBatch(batch)
+        let outcome = match run.answer {
+            Ok(value) -> MutationOutcome.Answered(value)
+            Error(failure) -> MutationOutcome.Failed(traceText(failure))
+        }
+        let result = MutationResult { number: mutate.number, outcome: outcome }
+        return afterBatch(batch.writes, position, move result)
+    }
+}
+
+/// The sync server over the database in `directory`.
+///
+/// # Failures
+/// The database failure of opening it.
+public function openSyncServer(
+    directory: borrow String,
+    functions: Functions,
+    authenticate: (borrow Value) -> Result<Value, String>
+) -> Result<SyncServer, SyncFailure> {
+    let database = try openDatabase(directory)
+    return .Ok(SyncServer { database: database, functions: functions, authenticate: authenticate })
+}

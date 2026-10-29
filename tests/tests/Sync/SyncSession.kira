@@ -1,0 +1,126 @@
+//! Tests for replica sessions: a reopened replica keeps its pending mutation, an unsubscribe releases its keys, and a server refuses a session that breaks the protocol.
+import Foundation
+import KiraDB
+
+// A replica closed with a pending mutation opens again with it still in the
+// view, and sends it on its next session. An unsubscribe releases the keys
+// its query held. A server answers a session that breaks the protocol.
+
+/// The reopened replica's view and pending mutations, before and after it
+/// connects.
+function scenarioReopenedReplica(rig: SyncRig) -> Result<[String], String> {
+    var open = rig
+    try open.replicas[0].mutate("addTodo", todo(5, "kept")) otherwise return .Error("no mutate")
+    try open.replicas[0].close() otherwise return .Error("no close")
+    let path = StoreTest.root + "/sync-reopen-replica-0"
+    open.replicas[0] = try openReplica(path, todoFunctions()) otherwise return .Error("no replica")
+    let query = open.replicas[0].subscribe("todos", .Null)
+    let reopened = open.shown(0, query)
+    let waiting = open.replicas[0].pending.count
+    open.connect(0, .Text("ada"))
+    try open.pump()
+    return .Ok([reopened, "\(waiting)", open.shown(0, query), "\(open.replicas[0].pending.count)"])
+}
+
+/// What an unsubscribe does to the replica: the changes it had seen, the
+/// subscribed ranges before and after, and the todos still stored.
+function scenarioUnsubscribe(rig: SyncRig) -> Result<[String], String> {
+    var open = rig
+    open.connect(0, .Text("ada"))
+    let query = open.replicas[0].subscribe("todos", .Null)
+    try open.replicas[0].mutate("addTodo", todo(6, "gone")) otherwise return .Error("no mutate")
+    try open.pump()
+    var changed = 0
+    for event in open.replicas[0].takeEvents() {
+        match event {
+            Changed(_) -> changed += 1
+            Welcomed(_) -> {}
+            Refused(_) -> {}
+            Done(_) -> {}
+        }
+    }
+    let before = open.replicas[0].held.ranges.count
+    open.replicas[0].unsubscribe(query)
+    try open.pump()
+    let stored = match open.replicas[0].database.documents(todoCollection()) {
+        Ok(documents) -> documents.count
+        Error(failure) -> return .Error(traceText(failure))
+    }
+    return .Ok(["\(changed)", "\(before)", "\(open.replicas[0].held.ranges.count)", "\(stored)"])
+}
+
+/// What the server answers sessions that break the protocol: each answer as
+/// `session text`, and whether each session has ended.
+function scenarioProtocolBreakers(rig: SyncRig) -> Result<[String], String> {
+    var open = rig
+    let early = open.server.open()
+    try open.server.receive(early, .Unsubscribe(1)) otherwise return .Error("too early")
+    let garbled = open.server.open()
+    try open.server.receiveFrame(garbled, [7, 7]) otherwise return .Error("garbled frame")
+    let skipping = open.server.open()
+    let hello = Hello { client: 0, credentials: .Text("ada") }
+    try open.server.receive(skipping, .Hello(hello)) otherwise return .Error("hello")
+    let ahead = Mutate { number: 2, name: "addTodo", arguments: todo(7, "ahead") }
+    try open.server.receive(skipping, .Mutate(ahead)) otherwise return .Error("mutate")
+    var lines: [String] = []
+    for outgoing in open.server.take() {
+        match outgoing.message {
+            Refused(reason) -> lines.append("\(outgoing.session) \(reason)")
+            Welcome(_) -> lines.append("\(outgoing.session) welcome")
+            SyncTransition(_) -> lines.append("\(outgoing.session) transition")
+        }
+    }
+    let ended = open.server.ended(early) && open.server.ended(garbled) && open.server.ended(
+        skipping
+    )
+    return .Ok([joinTexts(lines, "; "), "\(ended)"])
+}
+
+/// A pending mutation survives a close and reopen, and is sent on the next
+/// session.
+@Test
+function reopenedReplicaKeepsItsPendingMutation() {
+    let parts = match withRig("sync-reopen", 1, scenarioReopenedReplica) {
+        Ok(found) -> found
+        Error(reason) -> {
+            expect!((reason) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "[kept]")
+    expect!((parts[1]) == "1")
+    expect!((parts[2]) == "[kept]")
+    expect!((parts[3]) == "0")
+}
+
+/// An unsubscribe releases the keys its query held.
+@Test
+function unsubscribeReleasesItsKeys() {
+    let parts = match withRig("sync-release", 1, scenarioUnsubscribe) {
+        Ok(found) -> found
+        Error(reason) -> {
+            expect!((reason) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "2")
+    expect!((parts[1]) == "1")
+    expect!((parts[2]) == "0")
+    expect!((parts[3]) == "0")
+}
+
+/// Sessions that break the protocol are answered with their refusal, and end.
+@Test
+function protocolBreakersAreRefused() {
+    let parts = match withRig("sync-refusals", 0, scenarioProtocolBreakers) {
+        Ok(found) -> found
+        Error(reason) -> {
+            expect!((reason) == "")
+            return
+        }
+    }
+    expect!(
+        (parts[0]) == "1 malformed message; 2 malformed message; 3 welcome; 3 mutation out of order"
+    )
+    expect!((parts[1]) == "true")
+}

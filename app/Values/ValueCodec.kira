@@ -1,0 +1,189 @@
+//! The stored form of values: how a [`Value`] is written as bytes and read back.
+//!
+//! Each value starts with a tag byte, then its contents: a length-prefixed text for
+//! a number, a length-prefixed text for text, length-prefixed bytes for bytes, a
+//! count and the values for a list, and a count and named fields for a document.
+//! The format is SPEC section 3.1.
+import Foundation
+
+/// SPEC section 3.1. Open, so a byte no tag names still reads, and is refused.
+@Open
+enum ValueTag: UN8 {
+    /// A null value.
+    Null = 0
+    /// A false value.
+    False = 1
+    /// A true value.
+    True = 2
+    /// A number, stored as its text.
+    Number = 3
+    /// A text, stored as length-prefixed UTF-8.
+    Text = 4
+    /// A byte sequence, stored length-prefixed.
+    Bytes = 5
+    /// A list: a count, then the values.
+    List = 6
+    /// A document: a count, then each field's name and value.
+    Document = 7
+}
+
+/// Writing values into a byte array.
+extend Array<UN8> {
+    /// Appends the stored form of `value`.
+    function appendValue(borrow mut self, value: borrow Value) {
+        match value {
+            Null -> self.append(code(ValueTag.Null))
+            Bool(truth) -> self.append(code(truth ? ValueTag.True : ValueTag.False))
+            Number(number) -> {
+                self.append(code(ValueTag.Number))
+                appendLengthPrefixed(String(number).utf8())
+            }
+            Text(text) -> {
+                self.append(code(ValueTag.Text))
+                appendLengthPrefixed(text.utf8())
+            }
+            Bytes(bytes) -> {
+                self.append(code(ValueTag.Bytes))
+                appendLengthPrefixed(bytes)
+            }
+            List(items) -> {
+                self.append(code(ValueTag.List))
+                appendVarint(items.count)
+                for item in items { appendValue(item) }
+            }
+            Document(document) -> appendDocument(document)
+        }
+    }
+
+    /// Appends the stored form of `document`: its tag, its field count, then each field's name and value.
+    function appendDocument(borrow mut self, document: borrow Document) {
+        self.append(code(ValueTag.Document))
+        appendVarint(document.fields.count)
+        for (name, value) in document.fields {
+            appendLengthPrefixed(name.utf8())
+            appendValue(value)
+        }
+    }
+}
+
+/// The bytes a value is stored as.
+///
+/// Decoding them with `decodeValue` gives back an equal value.
+public function encodeValue(value: borrow Value) -> [UN8] {
+    var bytes: [UN8] = []
+    bytes.appendValue(value)
+    return bytes
+}
+
+/// The value stored in `bytes`, when the bytes hold exactly one value.
+///
+/// # Failures
+/// A `DecodeFailure` when the bytes do not read as one value, or bytes are left over after it.
+public function decodeValue(bytes: [UN8]) -> Result<Value, DecodeFailure> {
+    var cursor = ByteCursor { bytes: move bytes }
+    let value = try cursor.readValue()
+    if !cursor.atEnd() { return .Error(.TrailingBytes(cursor.offset)) }
+    return .Ok(value)
+}
+
+/// Reading stored values from bytes.
+extend ByteCursor {
+    /// Reads one stored value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode failure when the value is truncated, malformed or has an unknown tag.
+    function readValue(borrow mut self) -> Result<Value, DecodeFailure> {
+        let start = offset
+        let byte = try readByte()
+        return readTagged(byte, start)
+    }
+
+    /// Reads the contents of a value whose tag byte has been read.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownTag` at `start` for a tag no value uses, and the failure of reading the contents.
+    function readTagged(
+        borrow mut self,
+        byte: UN8,
+        start: UNumber
+    ) -> Result<Value, DecodeFailure> {
+        return match fromCode<ValueTag>(byte) {
+            Null -> .Ok(.Null)
+            False -> .Ok(.Bool(false))
+            True -> .Ok(.Bool(true))
+            Number -> readNumber()
+            Text -> readTextValue()
+            Bytes -> readBytesValue()
+            List -> readList()
+            Document -> readDocument()
+            else -> .Error(.UnknownTag(start))
+        }
+    }
+
+    /// Reads a stored text value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode failure when the text is malformed.
+    function readTextValue(borrow mut self) -> Result<Value, DecodeFailure> {
+        let text = try readText()
+        return .Ok(.Text(text))
+    }
+
+    /// Reads a stored byte value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode failure when the bytes are truncated.
+    function readBytesValue(borrow mut self) -> Result<Value, DecodeFailure> {
+        let bytes = try readLengthPrefixed()
+        return .Ok(.Bytes(bytes))
+    }
+
+    /// Reads a stored number, which is held as its text.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidNumber` at the number's offset when its text does not read as a number.
+    function readNumber(borrow mut self) -> Result<Value, DecodeFailure> {
+        let start = offset
+        let text = try readText()
+        return match parseNumber(text) {
+            Some(number) -> .Ok(.Number(number))
+            None -> .Error(.InvalidNumber(start))
+        }
+    }
+
+    /// Reads a stored list.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode failure when an item is malformed.
+    function readList(borrow mut self) -> Result<Value, DecodeFailure> {
+        let count = try readVarint()
+        var items: [Value] = []
+        for _ in 0..count {
+            let item = try readValue()
+            items.append(item)
+        }
+        return .Ok(.List(items))
+    }
+
+    /// Reads a stored document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode failure when a field name or value is malformed.
+    function readDocument(borrow mut self) -> Result<Value, DecodeFailure> {
+        let count = try readVarint()
+        var document = Document()
+        for _ in 0..count {
+            let name = try readText()
+            let value = try readValue()
+            document.fields.append((name, value))
+        }
+        return .Ok(.Document(document))
+    }
+}

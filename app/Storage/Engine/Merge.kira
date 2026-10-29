@@ -1,0 +1,126 @@
+//! Merging sorted runs of entries, and choosing which versions survive a merge.
+//!
+//! Entries are ordered by key ascending, then sequence descending. A merge keeps
+//! every version that a snapshot can still see, and the newest version at or below
+//! the oldest snapshot. The rules are SPEC section 5.7.
+import Foundation
+
+/// Sorted sources merged into one: key ascending, then sequence descending.
+function mergedEntries(sources: borrow [[Entry]]) -> [Entry] {
+    var merged: [Entry] = []
+    var positions: [UNumber] = []
+    for _ in sources { positions.append(0) }
+    while true {
+        match nextSource(sources, positions) {
+            Some(index) -> {
+                merged.append(copy sources[index][positions[index]])
+                positions[index] += 1
+            }
+            None -> break
+        }
+    }
+    return merged
+}
+
+/// The source whose next entry orders first, if any source has one left.
+function nextSource(sources: borrow [[Entry]], positions: borrow [UNumber]) -> UNumber? {
+    var chosen: UNumber? = .None
+    for (index, source) in sources.enumerated() {
+        if positions[index] >= source.count { continue }
+        match chosen {
+            Some(best) -> {
+                let leader = sources[best][positions[best]]
+                if source[positions[index]].orderedBefore(leader.key, leader.sequence) {
+                    chosen = .Some(index)
+                }
+            }
+            None -> chosen = .Some(index)
+        }
+    }
+    return chosen
+}
+
+/// What a merge does with a key's newest version at or below the snapshot
+/// when that version is a delete.
+enum Deletes {
+    /// Shallower levels may still hold older versions the delete hides.
+    Keep
+    /// The deepest level holds nothing older for the delete to hide.
+    Drop
+}
+
+/// The versions a merge keeps (SPEC section 5.7): for each key, every version
+/// newer than `snapshot` and the newest one at or below it, which `deletes`
+/// says the fate of when it is a delete.
+function retainedVersions(entries: borrow [Entry], snapshot: UNumber, deletes: Deletes) -> [Entry] {
+    var kept: [Entry] = []
+    var settledKey: [UN8]? = .None
+    for entry in entries {
+        if entry.sequence > snapshot {
+            kept.append(copy entry)
+            continue
+        }
+        if settledKey == .Some(copy entry.key) { continue }
+        settledKey = .Some(copy entry.key)
+        if isDelete(entry.version) && deletes == .Drop { continue }
+        kept.append(copy entry)
+    }
+    return kept
+}
+
+/// A key and the value it holds.
+public struct KeyValue {
+    /// The key's bytes.
+    let key: [UN8]
+    /// The value's bytes.
+    let value: [UN8]
+}
+
+/// What a read at `snapshot` sees of `entries`: each key's newest version at
+/// or below it, when that version is a put.
+function visibleValues(entries: borrow [Entry], snapshot: UNumber) -> [KeyValue] {
+    var visible: [KeyValue] = []
+    for entry in retainedVersions(entries, snapshot, .Drop) {
+        if entry.sequence > snapshot { continue }
+        match entry.version {
+            Put(value) -> visible.append(KeyValue { key: copy entry.key, value: copy value })
+            // `Drop` left no delete at or below the snapshot.
+            Delete -> continue
+        }
+    }
+    return visible
+}
+
+/// Returns whether `version` is a removal.
+function isDelete(version: borrow Version) -> Bool {
+    return match version {
+        Put(value) -> false
+        Delete -> true
+    }
+}
+
+/// The bytes an entry is counted as, in a memory table and in a table's size.
+function entryBytes(entry: borrow Entry) -> UNumber {
+    return entry.key.count + versionBytes(entry.version) + SkipList.entryOverhead
+}
+
+/// `entries` cut into runs of about `Tuning.memoryTableBytes`, each a table's
+/// worth. A key's versions stay in one run, so tables on one level never
+/// share a key.
+function tableChunks(entries: borrow [Entry]) -> [[Entry]] {
+    var chunks: [[Entry]] = []
+    var chunk: [Entry] = []
+    var size: UNumber = 0
+    for entry in entries {
+        let newKey = chunk.count > 0 && chunk[chunk.count - 1].key != entry.key
+        if newKey && size >= Tuning.memoryTableBytes {
+            chunks.append(move chunk)
+            chunk = []
+            size = 0
+        }
+        size += entryBytes(entry)
+        chunk.append(copy entry)
+    }
+    if chunk.count > 0 { chunks.append(move chunk) }
+    return chunks
+}

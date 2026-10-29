@@ -1,0 +1,159 @@
+//! The KiraDB benchmark: timed bulk writes and reads of documents and tables, printed phase by phase.
+import Foundation
+import KiraDB
+
+/// The benchmark sizes and the directory the benchmark writes its databases into.
+///
+/// The root is under the karc-work directory, not under `/tmp`, so a reboot does not discard the work.
+namespace Bench {
+    let root: String = "/Users/priamc/Code/kira-projects/karc-work/kiradb-bench"
+    // Each durable write syncs the log, so fewer of them.
+    let durable: Number = 2000
+    let bulk: Number = 100000
+    let lookups: Number = 100000
+    let indexed: Number = 1000
+}
+
+/// `bench <phase>` runs only that phase's work again, ten times over, after the
+/// whole run: a profile of it then shows little else.
+function repeated(phase: borrow String) -> Number {
+    return match processArgument(0) {
+        Some(asked) -> asked == phase ? 10 : 1
+        None -> 1
+    }
+}
+
+/// A timer that starts when it is made, and reports the work done since.
+struct Timer {
+    let started: Number = monotonicNanoseconds()
+
+    /// Prints `name`, the operations per second, and the milliseconds taken.
+    function report(borrow self, name: String, operations: Number) {
+        let nanoseconds = monotonicNanoseconds() - started
+        let milliseconds = round(nanoseconds / 1000000)
+        let rate = round(operations * 1000000000 / max(nanoseconds, 1))
+        print("\(name) \(rate)/s \(milliseconds)ms")
+    }
+}
+
+/// A new, empty benchmark directory called `name`, after removing what an earlier run left in it.
+///
+/// # Errors
+///
+/// Returns a message naming the path when the directory cannot be cleared or made.
+function freshDirectory(name: String) -> Result<String, String> {
+    let path = Bench.root + "/" + name
+    if pathExists(path) {
+        try removePath(path) otherwise return .Error("cannot clear \(path)")
+    }
+    if !isDirectory(Bench.root) {
+        try makeDirectory(Bench.root) otherwise return .Error("cannot make \(Bench.root)")
+    }
+    try makeDirectory(path) otherwise return .Error("cannot make \(path)")
+    return .Ok(path)
+}
+
+/// The document for item `key`: a name, a price of a quarter per key, and a stock count.
+function item(key: Number) -> Document {
+    var document = Document()
+    document.set("name", .Text("item \(key)"))
+    document.set("price", .Number(key * 0.25))
+    document.set("stock", .Number(key % 97))
+    return document
+}
+
+/// Runs the document benchmark: durable puts, one bulk change, point gets and a full scan.
+///
+/// # Errors
+///
+/// Returns a message naming the step that failed.
+function documents() -> Result<Void, String> {
+    let path = try freshDirectory("documents")
+    var database = try openDatabase(path) otherwise return .Error("cannot open")
+    let items = Collection { name: "items" }
+    var timer = Timer()
+    for key in 0..Bench.durable {
+        try database.put(items, .Number(key), item(key)) otherwise return .Error("put")
+    }
+    timer.report("durable puts", Bench.durable)
+    timer = Timer()
+    var changes = Changes()
+    for key in Bench.durable..Bench.durable + Bench.bulk {
+        try changes.put(items, .Number(key), item(key)) otherwise return .Error("bulk put")
+    }
+    try database.apply(changes) otherwise return .Error("apply")
+    timer.report("bulk puts", Bench.bulk)
+    if repeated("bulk") > 1 { return .Ok }
+    timer = Timer()
+    var found = 0
+    for index in 0..Bench.lookups * repeated("gets") {
+        let key = (index * 7919) % (Bench.durable + Bench.bulk)
+        let document = try database.get(items, .Number(key)) otherwise return .Error("get")
+        if document.isSome() { found += 1 }
+    }
+    timer.report("point gets", Bench.lookups)
+    timer = Timer()
+    var all: [KeyedDocument] = []
+    for _ in 0..repeated("scan") {
+        all = try database.documents(items) otherwise return .Error("scan")
+    }
+    timer.report("full scan", all.count * repeated("scan"))
+    try database.close() otherwise return .Error("close")
+    if found != Bench.lookups * repeated("gets") { return .Error("found \(found)") }
+    return .Ok
+}
+
+/// The table schema the table benchmark uses: an `id` key, a `name`, and a `stock` count indexed as `byStock`.
+function itemSchema() -> TableSchema {
+    return TableSchema {
+        name: "items",
+        columns: [
+            Column { name: "id", type: .Number },
+            Column { name: "name", type: .Text },
+            Column { name: "stock", type: .Number }
+        ],
+        primaryKey: ["id"],
+        indexes: [IndexSchema { name: "byStock", columns: ["stock"] }]
+    }
+}
+
+/// Runs the table benchmark: durable inserts and indexed selects.
+///
+/// # Errors
+///
+/// Returns a message naming the step that failed.
+function tables() -> Result<Void, String> {
+    let path = try freshDirectory("tables")
+    var database = try openDatabase(path) otherwise return .Error("cannot open")
+    let table = try database.createTable(itemSchema()) otherwise return .Error("create")
+    var timer = Timer()
+    for id in 0..Bench.durable {
+        var row = Document()
+        row.set("id", .Number(id))
+        row.set("name", .Text("item \(id)"))
+        row.set("stock", .Number(id % 97))
+        try database.insert(table, row) otherwise return .Error("insert")
+    }
+    timer.report("durable inserts", Bench.durable)
+    timer = Timer()
+    var rows = 0
+    for index in 0..Bench.indexed * repeated("selects") {
+        let query = table.query().filter(column("stock").equals(.Number(index % 97)))
+        let selected = try database.select(query) otherwise return .Error("select")
+        rows += selected.count
+    }
+    timer.report("indexed selects", Bench.indexed * repeated("selects"))
+    try database.close() otherwise return .Error("close")
+    return .Ok
+}
+
+/// Runs each benchmark in order and prints the reason for any that fails.
+@Main
+function main() {
+    for run in [documents, tables] {
+        match run() {
+            Ok -> {}
+            Error(reason) -> print("failed: \(reason)")
+        }
+    }
+}

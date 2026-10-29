@@ -1,0 +1,138 @@
+//! Reading stored bytes front to back, with every failure naming its offset.
+//!
+//! A [`ByteCursor`] reads values, lengths and checksummed blocks in order. Each read
+//! moves past what it took. A read that runs past the end, or finds bytes that do not
+//! decode, returns a [`DecodeFailure`] carrying the offset where it went wrong.
+import Foundation
+
+/// Why stored bytes could not be read back. Each case carries the offset in the bytes where the read failed.
+public enum DecodeFailure {
+    /// The bytes end at this offset while a value still needs more.
+    Truncated(UNumber)
+    /// A tag byte that no value is written with, at this offset.
+    UnknownTag(UNumber)
+    /// Text bytes that are not UTF-8, at this offset.
+    InvalidText(UNumber)
+    /// A number's text that does not read as a number, at this offset.
+    InvalidNumber(UNumber)
+    /// Bytes left over after a whole value, at this offset.
+    TrailingBytes(UNumber)
+    /// A checksum that does not match its block, at this offset.
+    Corrupt(UNumber)
+}
+
+/// Reads bytes front to back, each read moving past what it took.
+struct ByteCursor {
+    /// The bytes being read.
+    let bytes: [UN8]
+    /// The offset of the next byte to read.
+    var offset: UNumber = 0
+
+    /// Returns whether every byte has been read.
+    function atEnd(borrow self) -> Bool {
+        return offset >= bytes.count
+    }
+
+    /// Reads one byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Truncated` at the cursor when no byte is left.
+    function readByte(borrow mut self) -> Result<UN8, DecodeFailure> {
+        if offset >= bytes.count { return .Error(.Truncated(offset)) }
+        let byte = bytes[offset]
+        offset += 1
+        return .Ok(byte)
+    }
+
+    /// A variable-length number (SPEC section 3.2). A 65-bit mantissa takes at
+    /// most ten bytes, so an eleventh is corrupt.
+    function readVarint(borrow mut self) -> Result<UNumber, DecodeFailure> {
+        let start = offset
+        var value: UNumber = 0
+        var scale: UNumber = 1
+        for _ in 0..Varint.longest {
+            let byte = try readByte()
+            value += Number(byte & Varint.lowBits) * scale
+            if byte < Varint.continuation { return .Ok(value) }
+            scale *= Varint.payload
+        }
+        return .Error(.Corrupt(start))
+    }
+
+    /// Reads `count` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Truncated` at the cursor when fewer than `count` bytes are left.
+    function readBytes(borrow mut self, count: UNumber) -> Result<[UN8], DecodeFailure> {
+        if offset + count > bytes.count { return .Error(.Truncated(offset)) }
+        let out = byteRun(bytes, offset, offset + count)
+        offset += count
+        return .Ok(out)
+    }
+
+    /// Moves past a length and the bytes it counts.
+    function skipLengthPrefixed(borrow mut self) -> Result<Void, DecodeFailure> {
+        let count = try readVarint()
+        if offset + count > bytes.count { return .Error(.Truncated(offset)) }
+        offset += count
+        return .Ok
+    }
+
+    /// Compares the length-prefixed bytes at the cursor with `key` where they
+    /// lie, and moves past them.
+    function compareLengthPrefixed(
+        borrow mut self,
+        key: borrow [UN8]
+    ) -> Result<Ordering, DecodeFailure> {
+        let count = try readVarint()
+        if offset + count > bytes.count { return .Error(.Truncated(offset)) }
+        let ordering = compareRun(bytes, offset, count, key)
+        offset += count
+        return .Ok(ordering)
+    }
+
+    /// Reads a length-prefixed run of bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode failure when the length or the bytes are truncated.
+    function readLengthPrefixed(borrow mut self) -> Result<[UN8], DecodeFailure> {
+        let count = try readVarint()
+        return readBytes(count)
+    }
+
+    /// Reads a length-prefixed run of UTF-8 text.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidText` at the run's start when it is not UTF-8, and `Truncated` when it runs past the end.
+    function readText(borrow mut self) -> Result<String, DecodeFailure> {
+        let start = offset
+        let count = try readVarint()
+        if offset + count > bytes.count { return .Error(.Truncated(offset)) }
+        let text = textFromByteRun(bytes, offset, offset + count)
+        offset += count
+        return match text {
+            Some(read) -> .Ok(read)
+            None -> .Error(.InvalidText(start))
+        }
+    }
+}
+
+/// The `count` bytes of `bytes` from `start` against `key`, in key order.
+function compareRun(
+    bytes: borrow [UN8],
+    start: UNumber,
+    count: UNumber,
+    key: borrow [UN8]
+) -> Ordering {
+    for index in 0..min(count, key.count) {
+        let left = bytes[start + index]
+        let right = key[index]
+        if left < right { return .Less }
+        if left > right { return .Greater }
+    }
+    return compare(count, key.count)
+}

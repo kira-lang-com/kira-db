@@ -1,0 +1,153 @@
+//! Reading a catalog document back into a table's schema.
+//!
+//! The inverse of the catalog document written in `Catalog.kira`. Each function returns
+//! an optional: a catalog entry with a missing or mistyped field reads as no table.
+import Foundation
+
+/// The table a catalog document describes (SPEC section 7.3), when it reads
+/// as one.
+function tableOf(name: borrow String, document: borrow Document) -> Table? {
+    var id: Number = 0
+    match document.numberField("id") {
+        Some(number) -> id = number
+        None -> return .None
+    }
+    var columns: [Column] = []
+    match columnsOf(document) {
+        Some(read) -> columns = read
+        None -> return .None
+    }
+    var primaryKey: [String] = []
+    match textsIn(document, "primaryKey") {
+        Some(read) -> primaryKey = read
+        None -> return .None
+    }
+    return match indexesOf(document) {
+        Some(indexes) -> .Some(
+            Table {
+                schema: TableSchema {
+                    name: copy name,
+                    columns: move columns,
+                    primaryKey: move primaryKey,
+                    indexes: indexes.schemas
+                },
+                id: id,
+                indexIds: indexes.ids
+            }
+        )
+        None -> .None
+    }
+}
+
+/// A table's indexes as its catalog document lists them.
+struct IndexList {
+    /// The index schemas, in the order the catalog lists them.
+    var schemas: [IndexSchema] = []
+    /// The id of each index, in the same order.
+    var ids: [Number] = []
+}
+
+/// Returns the columns a catalog document lists, or `.None` when any column does not read.
+function columnsOf(document: borrow Document) -> [Column]? {
+    var described: [Value] = []
+    match document.listField("columns") {
+        Some(values) -> described = values
+        None -> return .None
+    }
+    var columns: [Column] = []
+    for value in described {
+        match value.document() {
+            Some(column) -> match columnOf(column) {
+                Some(read) -> columns.append(read)
+                None -> return .None
+            }
+            None -> return .None
+        }
+    }
+    return .Some(columns)
+}
+
+/// Returns the column a catalog entry describes, or `.None` when its name, type or optionality does not read.
+function columnOf(document: borrow Document) -> Column? {
+    var name = ""
+    match document.textField("name") {
+        Some(text) -> name = text
+        None -> return .None
+    }
+    var typeText = ""
+    match document.textField("type") {
+        Some(text) -> typeText = text
+        None -> return .None
+    }
+    return match typeNamed(typeText) {
+        Some(columnType) -> match document.truthField("optional") {
+            Some(optional) -> .Some(Column { name: name, type: columnType, optional: optional })
+            None -> .None
+        }
+        None -> .None
+    }
+}
+
+/// Returns the indexes a catalog document lists, or `.None` when any index does not read.
+function indexesOf(document: borrow Document) -> IndexList? {
+    var described: [Value] = []
+    match document.listField("indexes") {
+        Some(values) -> described = values
+        None -> return .None
+    }
+    var indexes = IndexList()
+    for value in described {
+        match value.document() {
+            Some(index) -> match indexOf(index) {
+                Some(read) -> {
+                    let (schema, id) = read
+                    indexes.schemas.append(schema)
+                    indexes.ids.append(id)
+                }
+                None -> return .None
+            }
+            None -> return .None
+        }
+    }
+    return .Some(indexes)
+}
+
+/// Returns the index schema and the id a catalog entry describes, or `.None` when a field does not read.
+function indexOf(document: borrow Document) -> (IndexSchema, Number)? {
+    var name = ""
+    match document.textField("name") {
+        Some(text) -> name = text
+        None -> return .None
+    }
+    var id: Number = 0
+    match document.numberField("id") {
+        Some(number) -> id = number
+        None -> return .None
+    }
+    var columns: [String] = []
+    match textsIn(document, "columns") {
+        Some(read) -> columns = read
+        None -> return .None
+    }
+    return match document.truthField("unique") {
+        Some(unique) -> .Some((IndexSchema { name: name, columns: columns, unique: unique }, id))
+        None -> .None
+    }
+}
+
+/// The texts of a field holding a list of texts.
+function textsIn(document: borrow Document, name: borrow String) -> [String]? {
+    var values: [Value] = []
+    match document.listField(name) {
+        Some(read) -> values = read
+        None -> return .None
+    }
+    var texts: [String] = []
+    for value in values {
+        match value.text() {
+            Some(text) -> texts.append(text)
+            None -> return .None
+        }
+    }
+    return .Some(texts)
+}

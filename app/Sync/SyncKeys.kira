@@ -1,0 +1,88 @@
+//! The keys sync state is stored under.
+//!
+//! Sync state lives under keys that start with the text `s`, followed by a name
+//! (SPEC section 8.2). The sync engine reads and writes these keys in the database
+//! it synchronises.
+import Foundation
+
+/// SPEC section 8.2: sync state lives under keys that start with `Text("s")`.
+namespace SyncSpace {
+    let marker: String = "s"
+}
+
+/// Returns the key of the sync state called `name`.
+function syncKey(name: borrow String) -> [UN8] {
+    var key: [UN8] = []
+    key.appendTextKey(SyncSpace.marker)
+    key.appendTextKey(name)
+    return key
+}
+
+/// Returns the key of the sync state called `name` for `number`.
+function syncNumberKey(name: borrow String, number: Number) -> [UN8] {
+    var key = syncKey(name)
+    key.appendNumberKey(number)
+    return key
+}
+
+/// Why a sync engine could not go on.
+public enum SyncFailure {
+    /// The database failed underneath the sync engine.
+    Database(DatabaseFailure)
+    /// Stored sync state does not read back.
+    Corrupt(DecodeFailure)
+    /// A replica's stored state is not what SPEC section 8.2 says.
+    Malformed
+}
+
+/// Reading sync state from a database.
+extend Database {
+    /// The store's last sequence: the server's version (SPEC section 8.2).
+    function version(borrow self) -> Number {
+        return store.manifest.lastSequence
+    }
+
+    /// The number stored at `key`, or `otherwise` when it holds none.
+    function storedNumber(
+        borrow self,
+        key: borrow [UN8],
+        otherwise: Number
+    ) -> Result<Number, SyncFailure> {
+        let found = try readKey(key)
+        return match found {
+            Some(bytes) -> numberIn(move bytes)
+            None -> .Ok(otherwise)
+        }
+    }
+}
+
+/// Returns the number the stored bytes hold.
+///
+/// # Errors
+///
+/// Returns `Malformed` when the bytes do not decode to a number.
+function numberIn(bytes: [UN8]) -> Result<Number, SyncFailure> {
+    let value = try decodeValue(move bytes)
+    return match value.number() {
+        Some(number) -> .Ok(number)
+        None -> .Error(.Malformed)
+    }
+}
+
+/// Converting failures when `try` passes them up.
+extend SyncFailure {
+    /// Returns the database failure as a `Database` sync failure.
+    function from(failure: DatabaseFailure) -> SyncFailure {
+        return .Database(failure)
+    }
+
+    /// Returns the storage failure as a `Database` sync failure.
+    function from(failure: StorageFailure) -> SyncFailure {
+        return .Database(.Storage(failure))
+    }
+
+    /// Returns the decode failure as a `Corrupt` sync failure.
+    function from(failure: DecodeFailure) -> SyncFailure {
+        return .Corrupt(failure)
+    }
+}

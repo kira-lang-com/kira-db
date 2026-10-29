@@ -1,0 +1,85 @@
+//! Sorting query results by the query's orders, with ties broken by primary key.
+//!
+//! Rows are compared on each order's encoded column value, in its direction, and
+//! then on their encoded primary key (SPEC section 7.5).
+import Foundation
+
+/// A row with the keys it sorts by: one per order, then its primary key.
+struct SortableRow {
+    /// The encoded keys, one per order and the primary key last.
+    let keys: [[UN8]]
+    /// The row itself.
+    let row: Document
+}
+
+/// The rows sorted by the query's orders, ties in primary key order (SPEC
+/// section 7.5). Rows read through the primary key with no order to apply
+/// are in that order already.
+function sortedRows(
+    query: borrow Query,
+    source: borrow Source,
+    rows: [Document]
+) -> Result<[Document], TableFailure> {
+    if query.orders.count == 0 && isPrimaryKey(source) { return .Ok(rows) }
+    var sortable: [SortableRow] = []
+    for row in rows {
+        let keys = try sortKeys(query, row)
+        sortable.append(SortableRow { keys: keys, row: copy row })
+    }
+    var directions: [Direction] = []
+    for order in query.orders { directions.append(copy order.direction) }
+    let sorted = sortable.sorted({ left, right in sortsBefore(left, right, directions) })
+    var ordered: [Document] = []
+    for entry in sorted { ordered.append(copy entry.row) }
+    return .Ok(ordered)
+}
+
+/// Returns whether `source` reads rows through the primary key.
+function isPrimaryKey(source: borrow Source) -> Bool {
+    return match source {
+        PrimaryKey -> true
+        Index(_) -> false
+    }
+}
+
+/// Returns the encoded keys `row` sorts by: one for each of the query's orders, then its primary key.
+///
+/// # Errors
+///
+/// Returns the failure of encoding a value.
+function sortKeys(query: borrow Query, row: borrow Document) -> Result< [[UN8]], TableFailure> {
+    var keys: [[UN8]] = []
+    for order in query.orders {
+        let key = try encodeKey(columnValues(row, [copy order.column]))
+        keys.append(key)
+    }
+    let primaryKey = try encodeKey(primaryKeyOf(query.table.schema, row))
+    keys.append(primaryKey)
+    return .Ok(keys)
+}
+
+/// Whether `left` sorts before `right`: by each order's key, in its
+/// direction, then by primary key, the last key.
+function sortsBefore(
+    left: borrow SortableRow,
+    right: borrow SortableRow,
+    directions: borrow [Direction]
+) -> Bool {
+    for (index, direction) in directions.enumerated() {
+        match compareKeys(left.keys[index], right.keys[index]) {
+            Less -> return isAscending(direction)
+            Greater -> return !isAscending(direction)
+            Equal -> continue
+        }
+    }
+    let last = directions.count
+    return compareKeys(left.keys[last], right.keys[last]) == .Less
+}
+
+/// Returns whether `direction` is ascending.
+function isAscending(direction: borrow Direction) -> Bool {
+    return match direction {
+        Ascending -> true
+        Descending -> false
+    }
+}

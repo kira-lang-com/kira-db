@@ -1,0 +1,117 @@
+//! Files the storage engine reads and writes, with every failure naming its path.
+//!
+//! A [`StorageFile`] is an open file handle and the path it was opened from. Every
+//! operation returns a [`StorageFailure`] that carries that path, so a failure can be
+//! reported without the caller knowing which file it came from.
+import Foundation
+
+/// An open file that names its path in every failure.
+struct StorageFile {
+    /// The path the file was opened from.
+    let path: String
+    /// The open file.
+    let handle: FileHandle
+
+    /// Reads `count` bytes starting at `offset`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StorageFailure` that names this file's path when the read fails.
+    function read(borrow self, offset: UNumber, count: UNumber) -> Result<[UN8], StorageFailure> {
+        return match handle.read(offset, count) {
+            Ok(bytes) -> .Ok(bytes)
+            Error(failure) -> .Error(failed(move failure))
+        }
+    }
+
+    /// Every byte of the file.
+    function readWhole(borrow self) -> Result<[UN8], StorageFailure> {
+        let size = try size()
+        return read(0, size)
+    }
+
+    /// The size of the file in bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StorageFailure` that names this file's path when the size cannot be read.
+    function size(borrow self) -> Result<UNumber, StorageFailure> {
+        return match handle.size() {
+            Ok(size) -> .Ok(size)
+            Error(failure) -> .Error(failed(move failure))
+        }
+    }
+
+    /// Writes `bytes` starting at `offset`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StorageFailure` that names this file's path when the write fails.
+    function write(
+        borrow self,
+        offset: UNumber,
+        bytes: borrow [UN8]
+    ) -> Result<Void, StorageFailure> {
+        return done(handle.write(offset, bytes))
+    }
+
+    /// Flushes the written bytes of this file to the disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StorageFailure` that names this file's path when the flush fails.
+    function sync(borrow self) -> Result<Void, StorageFailure> {
+        return done(handle.sync())
+    }
+
+    /// Closes the file handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `StorageFailure` that names this file's path when the close fails.
+    function close(borrow self) -> Result<Void, StorageFailure> {
+        return done(handle.close())
+    }
+
+    /// Turns a handle's result into a storage result, naming this file in any failure.
+    function done(
+        borrow self,
+        result: Result<Void, FileHandleFailure>
+    ) -> Result<Void, StorageFailure> {
+        return match result {
+            Ok -> .Ok
+            Error(failure) -> .Error(failed(move failure))
+        }
+    }
+
+    /// The storage failure for `failure`, carrying this file's path.
+    function failed(borrow self, failure: FileHandleFailure) -> StorageFailure {
+        return .File((copy path, failure))
+    }
+}
+
+/// The file at `path`, opened for `access`.
+function openStorageFile(
+    path: borrow String,
+    access: FileAccess
+) -> Result<StorageFile, StorageFailure> {
+    return match openFileHandle(path, move access) {
+        Ok(handle) -> .Ok(StorageFile { path: copy path, handle: handle })
+        Error(failure) -> .Error(.File((copy path, failure)))
+    }
+}
+
+extend StorageFile {
+    /// Stored bytes of this file that do not read back.
+    function corrupt(borrow self, failure: DecodeFailure) -> StorageFailure {
+        return .Corrupt((copy path, failure))
+    }
+}
+
+/// Writes `bytes` as a new file at `path`, synced and closed.
+function writeNewFile(path: borrow String, bytes: borrow [UN8]) -> Result<Void, StorageFailure> {
+    let file = try openStorageFile(path, .CreateNew)
+    try file.write(0, bytes)
+    try file.sync()
+    return file.close()
+}

@@ -1,0 +1,102 @@
+//! What a write changes for each session of the sync server.
+//!
+//! After every batch, each subscription that read a key the batch wrote is run again,
+//! and each session is sent its transition: the writes it holds that changed, the
+//! key ranges it now holds or releases, and any results for its own mutation
+//! (SPEC section 8.4).
+import Foundation
+
+/// SPEC section 8.4: what a batch changes for every session.
+extend SyncServer {
+    /// Runs again every subscription that read a key `writes` wrote, then
+    /// sends every session its transition; the one at `position` also gets
+    /// `result`.
+    function afterBatch(
+        borrow mut self,
+        writes: borrow [Write],
+        position: UNumber,
+        result: MutationResult
+    ) -> Result<Void, SyncFailure> {
+        for index in 0..sessions.count {
+            let caller = match sessions[index].caller {
+                Some(caller) -> caller
+                None -> continue
+            }
+            for query in 0..sessions[index].subscriptions.count {
+                let subscription = sessions[index].subscriptions[query]
+                if !subscription.reads.touches(writes) { continue }
+                let run = database.runQuery(
+                    functions,
+                    subscription.name,
+                    caller,
+                    subscription.arguments
+                )
+                sessions[index].subscriptions[query].reads = run.reads
+            }
+        }
+        for index in 0..sessions.count {
+            let results = index == position ? [copy result] : []
+            try sendTransition(index, writes, move results)
+        }
+        return .Ok
+    }
+
+    /// Sends the session at `position` its transition to the current
+    /// version, when anything changed for it.
+    function sendTransition(
+        borrow mut self,
+        position: UNumber,
+        writes: borrow [Write],
+        results: [MutationResult]
+    ) -> Result<Void, SyncFailure> {
+        let session = sessions[position]
+        if session.ended { return .Ok }
+        let caller = match session.caller {
+            Some(caller) -> caller
+            None -> return .Ok
+        }
+        let old = session.held
+        var reads: [KeyRange] = []
+        var ready: [Number] = []
+        for (index, subscription) in session.subscriptions.enumerated() {
+            for range in subscription.reads.ranges { reads.append(copy range) }
+            if subscription.ready { continue }
+            ready.append(subscription.query)
+            sessions[position].subscriptions[index].ready = true
+        }
+        let new = rangesOf(reads)
+        var changes: [Change] = []
+        for write in writes {
+            let key = writtenKey(write)
+            if old.contains(key) && new.contains(key) { changes.append(.Write(writtenOf(write))) }
+        }
+        for range in differenceOf(new, old).ranges {
+            let pairs = try database.scanKeys(range.start, range.end)
+            changes.append(.Hold(Held { range: copy range, pairs: pairs }))
+        }
+        for range in differenceOf(old, new).ranges { changes.append(.Release(copy range)) }
+        sessions[position].held = new
+        if changes.count == 0 && ready.count == 0 && results.count == 0 { return .Ok }
+        let applied = try database.storedNumber(syncNumberKey("applied", caller.client), 0)
+        let transition = SyncTransition {
+            version: database.version(),
+            applied: applied,
+            changes: changes,
+            ready: ready,
+            results: results
+        }
+        outbox.append(Outgoing { session: session.id, message: .SyncTransition(transition) })
+        return .Ok
+    }
+}
+
+/// Returns the written form of a write: its key and its new value, or no value for a removal.
+function writtenOf(write: borrow Write) -> Written {
+    return match write {
+        Put(entry) -> {
+            let (key, value) = entry
+            Written { key: copy key, value: .Some(copy value) }
+        }
+        Delete(key) -> Written { key: copy key, value: .None }
+    }
+}

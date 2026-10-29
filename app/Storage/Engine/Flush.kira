@@ -1,0 +1,56 @@
+//! Flushing the memory table to disk, and starting a new log.
+//!
+//! A flush writes the memory table out as a level 0 table, records it in the
+//! manifest together with the new log, and removes the log whose writes the table now
+//! holds. The order of those steps is what makes a crash leave a consistent store.
+import Foundation
+
+extend Store {
+    /// Writes the memory table out as a level 0 table and starts a new log.
+    function flush(borrow mut self) -> Result<Void, StorageFailure> {
+        let number = manifest.takeFileNumber()
+        let fresh = try createLog(logPath(directory, number))
+        try log.close()
+        let retired = manifest.log
+        log = fresh
+        manifest.log = number
+        return settle(retired)
+    }
+
+    /// SPEC section 5.4: the memory table, if it holds anything, becomes a
+    /// level 0 table; the manifest records it and the current log; then the
+    /// log `retired`, whose writes the table now holds, is removed. A crash
+    /// before the manifest is stored leaves the retired log in force.
+    function settle(borrow mut self, retired: UNumber) -> Result<Void, StorageFailure> {
+        let entries = memory.entries()
+        if entries.count > 0 {
+            let live = try writeLiveTable(entries, 0)
+            manifest.tables.append(copy live.record)
+            tables.append(live)
+            tables = byRecency(move tables)
+        }
+        try storeManifest(directory, manifest)
+        memory = MemoryTable()
+        try removePath(logPath(directory, retired))
+        return .Ok
+    }
+
+    /// Writes `entries`, in order, as a new table at `level`, and opens it.
+    function writeLiveTable(
+        borrow mut self,
+        entries: borrow [Entry],
+        level: UNumber
+    ) -> Result<LiveTable, StorageFailure> {
+        let number = manifest.takeFileNumber()
+        let path = tablePath(directory, number)
+        let size = try writeTable(path, entries)
+        let record = TableRecord {
+            level: level,
+            number: number,
+            smallest: copy entries[0].key,
+            largest: copy entries[entries.count - 1].key
+        }
+        let table = try openTable(path)
+        return .Ok(LiveTable { record: record, table: table, size: size })
+    }
+}

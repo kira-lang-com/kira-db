@@ -1,0 +1,63 @@
+//! Tests for stale data: a reopened replica drops the stored keys that its new subscriptions do not read.
+import Foundation
+import KiraDB
+
+/// What a replica stores of the todos, by text.
+function storedTexts(replica: borrow Replica) -> String {
+    let documents = match replica.database.documents(todoCollection()) {
+        Ok(documents) -> documents
+        Error(failure) -> return traceText(failure)
+    }
+    var texts: [String] = []
+    for keyed in documents {
+        match keyed.document.textField("text") {
+            Some(text) -> texts.append(text)
+            None -> texts.append("?")
+        }
+    }
+    return "[" + joinTexts(texts, ",") + "]"
+}
+
+/// A replica opened again keeps what it held as stale until its new
+/// subscriptions are ready, then drops the stale keys they do not read. The
+/// parts are the stored todos offline, readiness, the view, and the stored
+/// todos after the drop.
+function scenarioStaleDropped(rig: SyncRig) -> Result<[String], String> {
+    var open = rig
+    open.connect(0, .Text("ada"))
+    open.replicas[0].subscribe("todos", .Null)
+    try open.replicas[0].mutate("addTodo", todo(1, "one")) otherwise return .Error("no mutate")
+    try open.replicas[0].mutate("addTodo", todo(2, "two")) otherwise return .Error("no mutate")
+    try open.pump()
+    open.drop(0)
+    try open.replicas[0].close() otherwise return .Error("no close")
+    let path = StoreTest.root + "/sync-stale-replica-0"
+    open.replicas[0] = try openReplica(path, todoFunctions()) otherwise return .Error("no replica")
+    let query = open.replicas[0].subscribe("todo", .Number(1))
+    let offline = storedTexts(open.replicas[0])
+    open.connect(0, .Text("ada"))
+    try open.pump()
+    let ready = open.replicas[0].ready(query)
+    let shown = match open.replicas[0].result(query) {
+        Ok(value) -> traceText(value)
+        Error(failure) -> traceText(failure)
+    }
+    return .Ok([offline, "\(ready)", shown, storedTexts(open.replicas[0])])
+}
+
+/// A replica that reopens keeps its stale todos until they are read again, and
+/// drops those no subscription reads.
+@Test
+function reopenedReplicaDropsStaleTodos() {
+    let parts = match withRig("sync-stale", 1, scenarioStaleDropped) {
+        Ok(found) -> found
+        Error(reason) -> {
+            expect!((reason) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "[one,two]")
+    expect!((parts[1]) == "true")
+    expect!((parts[2]) == "Value.Text(\"one\")")
+    expect!((parts[3]) == "[one]")
+}

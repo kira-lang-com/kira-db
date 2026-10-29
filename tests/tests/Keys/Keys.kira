@@ -1,0 +1,109 @@
+//! Tests for key encoding: encoded keys sort as their values do, and decode back to them.
+import Foundation
+import KiraDB
+
+// Keys: the encoded order matches the order of the values, across numbers,
+// text and kinds, tuples order by their first value, and every key decodes
+// back to its values.
+
+/// How many neighbouring pairs of `values` encode out of order, or the failure
+/// of the first value that has no key.
+function outOfOrderPairs(values: borrow [Value]) -> Result<Number, KeyFailure> {
+    var keys: [[UN8]] = []
+    for value in values {
+        let key = try encodeKey([value])
+        keys.append(key)
+    }
+    var wrong: Number = 0
+    for index in 1..keys.count {
+        match compareKeys(keys[index - 1], keys[index]) {
+            Less -> {}
+            Equal, Greater -> wrong += 1
+        }
+    }
+    return .Ok(wrong)
+}
+
+/// Each value encoded as a key and decoded back, as a trail shows it.
+function decodedKeyTexts(values: borrow [Value]) -> [String] {
+    var texts: [String] = []
+    for value in values {
+        let decoded = match encodeKey([copy value]) {
+            Ok(key) -> match decodeKey(move key) {
+                Ok(parts) -> traceText(parts)
+                Error(failure) -> traceText(failure)
+            }
+            Error(failure) -> traceText(failure)
+        }
+        texts.append(decoded)
+    }
+    return texts
+}
+
+/// Expects every neighbouring pair of `values` to encode in order, and reports
+/// the failure of any value that has no key.
+function expectInOrder(values: borrow [Value]) {
+    match outOfOrderPairs(values) {
+        Ok(wrong) -> expect!((wrong) == (0))
+        Error(failure) -> expect!((traceText(failure)) == "")
+    }
+}
+
+/// Negative and positive numbers, fractions and the largest integer, in order.
+@Test
+function numberKeysFollowNumericOrder() {
+    let values: [Value] = [.Number(-1000), .Number(-12.5), .Number(-12.25), .Number(-1), .Number(
+        -0.001
+    ), .Number(0), .Number(0.000123), .Number(0.5), .Number(1), .Number(1.05), .Number(
+        1.5
+    ), .Number(9), .Number(10), .Number(123000), .Number(18446744073709551615)]
+    expectInOrder(values)
+}
+
+/// Null sorts before booleans, booleans before numbers, numbers before text,
+/// and text before bytes; within text and bytes, prefixes sort first.
+@Test
+function kindsAndTextFollowTheirOrder() {
+    let values: [Value] = [.Null, .Bool(false), .Bool(true), .Number(-5), .Number(0), .Number(
+        7
+    ), .Text(""), .Text("a"), .Text("a\0"), .Text("ab"), .Text("b"), .Bytes([]), .Bytes(
+        [0]
+    ), .Bytes([0, 0]), .Bytes([1])]
+    expectInOrder(values)
+}
+
+/// A tuple's order is set by its first value before its second.
+@Test
+function tuplesOrderByTheirFirstValue() {
+    let first = match encodeKey([.Text("a"), .Number(9)]) {
+        Ok(key) -> key
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    let second = match encodeKey([.Text("ab"), .Number(1)]) {
+        Ok(key) -> key
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expect!((traceText(compareKeys(first, second))) == "Ordering.Less")
+}
+
+/// Every number key decodes to the number it encodes, across magnitudes.
+@Test
+function numberKeysDecodeToTheirValues() {
+    let values: [Value] = [.Number(0), .Number(7), .Number(-2.5), .Number(0.001), .Number(
+        1200
+    ), .Number(0.000000000000000001), .Number(1000000000000000000), .Number(
+        123456789.123456789
+    ), .Number(18446744073709551615), .Number(-18446744073709551615)]
+    let texts = decodedKeyTexts(values)
+    expect!((texts.count) == (10))
+    expect!((texts[0]) == "[Value.Number(0)]")
+    expect!((texts[2]) == "[Value.Number(-2.5)]")
+    expect!((texts[7]) == "[Value.Number(123456789.123456789)]")
+    expect!((texts[9]) == "[Value.Number(-18446744073709551615)]")
+}

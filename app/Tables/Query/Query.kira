@@ -1,0 +1,174 @@
+//! Queries: the conditions, orders, limit and columns a read applies to a table.
+//!
+//! A query starts from `Table.query()`, or from the `query` function on a table, and
+//! each function on [`Query`] answers a copy with one more part set. The conditions,
+//! orders, limit and columns are checked by `QueryCheck.kira` before a read runs
+//! (SPEC section 7.5).
+import Foundation
+
+/// How a column's value is compared with a condition's value (SPEC section 7.5).
+public enum Relation {
+    /// The column equals the value.
+    Equal
+    /// The column does not equal the value.
+    NotEqual
+    /// The column is less than the value.
+    Less
+    /// The column is less than or equal to the value.
+    LessOrEqual
+    /// The column is greater than the value.
+    Greater
+    /// The column is greater than or equal to the value.
+    GreaterOrEqual
+}
+
+/// One column compared with one value.
+public struct Comparison {
+    /// The column's name.
+    let column: String
+    /// How the column is compared.
+    let relation: Relation
+    /// The value the column is compared with.
+    let value: Value
+}
+
+/// A test a row must pass to be part of a query's answer.
+public enum Condition {
+    /// A column compared with a value.
+    Compare(Comparison)
+    /// The column holds no value. Carries the column's name.
+    IsNull(String)
+    /// Every one of the conditions holds.
+    AllOf([Condition])
+    /// At least one of the conditions holds.
+    AnyOf([Condition])
+}
+
+/// The order rows are sorted in.
+public enum Direction {
+    /// Smallest first.
+    Ascending
+    /// Largest first.
+    Descending
+}
+
+/// One column a query's rows are sorted by.
+public struct Order {
+    /// The column to sort by.
+    let column: String
+    /// Whether the column sorts ascending or descending.
+    let direction: Direction
+}
+
+/// The rows of a table a read answers: those every condition holds for, sorted by the orders, at most `limit` of them, holding only `columns` when it names any.
+///
+/// Build a query from `Table.query()` and the functions on it. Each function answers a copy with one more part set, so the original is unchanged.
+public struct Query {
+    /// The table the rows come from.
+    let table: Table
+    /// The conditions every returned row passes.
+    var conditions: [Condition] = []
+    /// The sort keys, the first most significant.
+    var orders: [Order] = []
+    /// The most rows to return, or `.None` for every row.
+    var limit: UNumber? = .None
+    /// The columns each row keeps, in order. Empty keeps every column.
+    var columns: [String] = []
+
+    /// This query, keeping only the rows `condition` holds for as well.
+    function filter(borrow self, condition: Condition) -> Query {
+        var narrowed = copy self
+        narrowed.conditions.append(condition)
+        return narrowed
+    }
+
+    /// This query, sorted by `order` after the orders it already has.
+    function ordered(borrow self, order: Order) -> Query {
+        var sorted = copy self
+        sorted.orders.append(order)
+        return sorted
+    }
+
+    /// This query, answering at most `count` rows.
+    function limited(borrow self, count: UNumber) -> Query {
+        var bounded = copy self
+        bounded.limit = .Some(count)
+        return bounded
+    }
+
+    /// This query, where each row holds only `names`, in that order.
+    function selecting(borrow self, names: [String]) -> Query {
+        var projected = copy self
+        projected.columns = names
+        return projected
+    }
+}
+
+/// Starting a query from a table.
+extend Table {
+    /// Every row of the table, in primary key order.
+    function query(borrow self) -> Query {
+        return Query { table: copy self }
+    }
+}
+
+/// A column, named to build conditions and orders on it.
+public struct ColumnName {
+    /// The column's name.
+    let name: String
+
+    /// A condition that the column equals `value`.
+    function equals(borrow self, value: Value) -> Condition {
+        return compared(.Equal, move value)
+    }
+
+    /// A condition that the column does not equal `value`.
+    function notEquals(borrow self, value: Value) -> Condition {
+        return compared(.NotEqual, move value)
+    }
+
+    /// A condition that the column is less than `value`.
+    function lessThan(borrow self, value: Value) -> Condition {
+        return compared(.Less, move value)
+    }
+
+    /// A condition that the column is less than or equal to `value`.
+    function atMost(borrow self, value: Value) -> Condition {
+        return compared(.LessOrEqual, move value)
+    }
+
+    /// A condition that the column is greater than `value`.
+    function greaterThan(borrow self, value: Value) -> Condition {
+        return compared(.Greater, move value)
+    }
+
+    /// A condition that the column is greater than or equal to `value`.
+    function atLeast(borrow self, value: Value) -> Condition {
+        return compared(.GreaterOrEqual, move value)
+    }
+
+    /// A condition that the column holds no value.
+    function isNull(borrow self) -> Condition {
+        return .IsNull(copy name)
+    }
+
+    /// An order that sorts rows by the column, smallest first.
+    function ascending(borrow self) -> Order {
+        return Order { column: copy name, direction: .Ascending }
+    }
+
+    /// An order that sorts rows by the column, largest first.
+    function descending(borrow self) -> Order {
+        return Order { column: copy name, direction: .Descending }
+    }
+
+    /// A condition comparing the column with `value` by `relation`.
+    function compared(borrow self, relation: Relation, value: Value) -> Condition {
+        return .Compare(Comparison { column: copy name, relation: relation, value: value })
+    }
+}
+
+/// A column named `name`, to build conditions and orders on.
+public function column(name: String) -> ColumnName {
+    return ColumnName { name: name }
+}

@@ -1,0 +1,198 @@
+//! Reading the typed documents of sync messages back into messages.
+//!
+//! The inverse of the writing in `MessageCodec.kira`. Each field read names the field
+//! it expects, and a missing or mistyped field is a `Malformed` message.
+import Foundation
+
+/// A `transition` document read back (SPEC section 8.3).
+function transitionOf(document: borrow Document) -> Result<SyncTransition, MessageFailure> {
+    let version = try numberOf(document, "version")
+    let applied = try numberOf(document, "applied")
+    var changes: [Change] = []
+    let changeValues = try listOf(document, "changes")
+    for value in changeValues {
+        let changeDocument = try documentIn(value)
+        let change = try changeOf(changeDocument)
+        changes.append(change)
+    }
+    var ready: [Number] = []
+    let readyValues = try listOf(document, "ready")
+    for value in readyValues {
+        match value.number() {
+            Some(query) -> ready.append(query)
+            None -> return .Error(.Malformed)
+        }
+    }
+    var results: [MutationResult] = []
+    let resultValues = try listOf(document, "results")
+    for value in resultValues {
+        let resultDocument = try documentIn(value)
+        let result = try resultOf(resultDocument)
+        results.append(result)
+    }
+    return .Ok(
+        SyncTransition {
+            version: version,
+            applied: applied,
+            changes: changes,
+            ready: ready,
+            results: results
+        }
+    )
+}
+
+/// Reads a change document: a write, a hold or a release.
+///
+/// # Errors
+///
+/// Returns `Malformed` for an unknown kind or a field of the wrong type.
+function changeOf(document: borrow Document) -> Result<Change, MessageFailure> {
+    let kind = try textOf(document, "type")
+    if kind == "write" {
+        let key = try bytesOf(document, "key")
+        let value = try valueOf(document, "value")
+        return match value {
+            Bytes(bytes) -> .Ok(.Write(Written { key: key, value: .Some(bytes) }))
+            Null -> .Ok(.Write(Written { key: key, value: .None }))
+            Bool(_) -> .Error(.Malformed)
+            Number(_) -> .Error(.Malformed)
+            Text(_) -> .Error(.Malformed)
+            List(_) -> .Error(.Malformed)
+            Document(_) -> .Error(.Malformed)
+        }
+    }
+    if kind == "hold" {
+        let range = try rangeOf(document)
+        var pairs: [KeyValue] = []
+        let pairValues = try listOf(document, "pairs")
+        for value in pairValues {
+            let pair = try documentIn(value)
+            let key = try bytesOf(pair, "key")
+            let bytes = try bytesOf(pair, "value")
+            pairs.append(KeyValue { key: key, value: bytes })
+        }
+        return .Ok(.Hold(Held { range: range, pairs: pairs }))
+    }
+    if kind == "release" {
+        let range = try rangeOf(document)
+        return .Ok(.Release(range))
+    }
+    return .Error(.Malformed)
+}
+
+/// Reads a mutation result: its value, its failure, or its skipped flag.
+///
+/// # Errors
+///
+/// Returns `Malformed` when the result holds none of the three.
+function resultOf(document: borrow Document) -> Result<MutationResult, MessageFailure> {
+    let number = try numberOf(document, "number")
+    match document.field("value") {
+        Some(value) -> return .Ok(MutationResult { number: number, outcome: .Answered(value) })
+        // The mutation did not answer a value.
+        None -> {}
+    }
+    match document.textField("failure") {
+        Some(reason) -> return .Ok(MutationResult { number: number, outcome: .Failed(reason) })
+        // Nor did it fail.
+        None -> {}
+    }
+    return match document.truthField("skipped") {
+        Some(skipped) -> skipped
+        ? .Ok(MutationResult { number : number, outcome: .Skipped })
+        : .Error(.Malformed)
+        None -> .Error(.Malformed)
+    }
+}
+
+/// Reads a key range from its start and end fields.
+///
+/// # Errors
+///
+/// Returns `Malformed` when either bound is missing or not bytes.
+function rangeOf(document: borrow Document) -> Result<KeyRange, MessageFailure> {
+    let start = try bytesOf(document, "start")
+    let end = try bytesOf(document, "end")
+    return .Ok(KeyRange { start: start, end: end })
+}
+
+/// Returns the value of the field `name`.
+///
+/// # Errors
+///
+/// Returns `Malformed` when the field is missing.
+function valueOf(document: borrow Document, name: borrow String) -> Result<Value, MessageFailure> {
+    return match document.field(name) {
+        Some(value) -> .Ok(value)
+        None -> .Error(.Malformed)
+    }
+}
+
+/// Returns the text of the field `name`.
+///
+/// # Errors
+///
+/// Returns `Malformed` when the field is missing or not text.
+function textOf(document: borrow Document, name: borrow String) -> Result<String, MessageFailure> {
+    return match document.textField(name) {
+        Some(text) -> .Ok(text)
+        None -> .Error(.Malformed)
+    }
+}
+
+/// Returns the number of the field `name`.
+///
+/// # Errors
+///
+/// Returns `Malformed` when the field is missing or not a number.
+function numberOf(
+    document: borrow Document,
+    name: borrow String
+) -> Result<Number, MessageFailure> {
+    return match document.numberField(name) {
+        Some(number) -> .Ok(number)
+        None -> .Error(.Malformed)
+    }
+}
+
+/// Returns the values of the list field `name`.
+///
+/// # Errors
+///
+/// Returns `Malformed` when the field is missing or not a list.
+function listOf(document: borrow Document, name: borrow String) -> Result<[Value], MessageFailure> {
+    return match document.listField(name) {
+        Some(values) -> .Ok(values)
+        None -> .Error(.Malformed)
+    }
+}
+
+/// Returns the bytes of the field `name`.
+///
+/// # Errors
+///
+/// Returns `Malformed` when the field is missing or not bytes.
+function bytesOf(document: borrow Document, name: borrow String) -> Result<[UN8], MessageFailure> {
+    let value = try valueOf(document, name)
+    return match value {
+        Bytes(bytes) -> .Ok(bytes)
+        Null -> .Error(.Malformed)
+        Bool(_) -> .Error(.Malformed)
+        Number(_) -> .Error(.Malformed)
+        Text(_) -> .Error(.Malformed)
+        List(_) -> .Error(.Malformed)
+        Document(_) -> .Error(.Malformed)
+    }
+}
+
+/// Returns the document a value holds.
+///
+/// # Errors
+///
+/// Returns `Malformed` when the value is not a document.
+function documentIn(value: borrow Value) -> Result<Document, MessageFailure> {
+    return match value.document() {
+        Some(document) -> .Ok(document)
+        None -> .Error(.Malformed)
+    }
+}

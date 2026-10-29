@@ -1,0 +1,44 @@
+//! Four-byte big-endian words, as the log headers, table checksums and table footers
+//! write them.
+//!
+//! The format is SPEC sections 5.3 and 5.5.
+import Foundation
+
+/// Four-byte numbers, high byte first, as the log's record header and a
+/// table's checksums and footer write them (SPEC sections 5.3 and 5.5).
+namespace BigEndian {
+    let wordBytes: UNumber = 4
+    /// The number of values one byte holds.
+    let byteValues: UNumber = 256
+}
+
+extend Array<UN8> {
+    /// Appends `value` to this array as four bytes, high byte first.
+    function appendWord(borrow mut self, value: UN32) {
+        var divisor: UNumber = 1
+        for _ in 1..BigEndian.wordBytes { divisor *= BigEndian.byteValues }
+        for _ in 0..BigEndian.wordBytes {
+            self.append(UN8(floor(value / divisor) % BigEndian.byteValues))
+            divisor = divisor / BigEndian.byteValues
+        }
+    }
+}
+
+extend ByteCursor {
+    /// Reads the next four bytes of the cursor as a big-endian word.
+    ///
+    /// # Errors
+    ///
+    /// Returns the cursor's `DecodeFailure` when fewer than four bytes remain.
+    function readWord(borrow mut self) -> Result<UN32, DecodeFailure> {
+        let bytes = try readBytes(BigEndian.wordBytes)
+        return .Ok(wordOf(bytes))
+    }
+}
+
+/// Returns the word that four big-endian `bytes` hold.
+function wordOf(bytes: borrow [UN8]) -> UN32 {
+    var value: UNumber = 0
+    for byte in bytes { value = value * BigEndian.byteValues + byte }
+    return UN32(value)
+}

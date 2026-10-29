@@ -1,0 +1,177 @@
+//! Encoding values as keys, so that the bytes of a key order the way the values do.
+//!
+//! A key is a run of key parts, one for each value. Each part starts with a tag
+//! byte that orders the kinds of value, and numbers, text and bytes are written so
+//! that byte order matches value order. The format is SPEC section 4. Lists and
+//! documents have no key form.
+import Foundation
+
+/// SPEC section 4: values encoded so that byte order is value order. Open,
+/// so a byte no tag names still reads, and is refused.
+@Open
+enum KeyTag: UN8 {
+    /// A null value.
+    Null = 1
+    /// A false value.
+    False = 2
+    /// A true value.
+    True = 3
+    /// A negative number.
+    Negative = 16
+    /// The number zero.
+    Zero = 17
+    /// A positive number.
+    Positive = 18
+    /// A text value.
+    Text = 32
+    /// A byte value.
+    Bytes = 48
+}
+
+/// The bytes of a number's decimal text.
+namespace KeyText {
+    /// The byte of the digit zero.
+    let zero: UN8 = 48
+    /// The byte of the decimal point.
+    let point: UN8 = 46
+}
+
+/// The bytes that escape zero bytes and end escaped runs.
+namespace KeyEscape {
+    /// The zero byte, which an escaped run escapes.
+    let zero: UN8 = 0
+    /// The byte a zero byte is escaped to.
+    let escapedZero: UN8 = 255
+    /// The byte that ends an escaped run.
+    let terminator: UN8 = 1
+    /// The bias added to a number's exponent, so the exponent's bytes order as the exponent does.
+    let exponentBias: Number = 32768
+    /// The number of values one byte holds.
+    let byteRange: Number = 256
+    /// The byte that ends a number's digits.
+    let digitEnd: UN8 = 0
+    /// The largest byte. A negative number's body is complemented from it.
+    let largestByte: UN8 = 255
+    /// A number's body: two exponent bytes, then digits written `digit + 1`.
+    let exponentBytes: UNumber = 2
+    /// The amount each digit is written above its value.
+    let digitOffset: UN8 = 1
+}
+
+/// Why a value cannot be part of a key.
+public enum KeyFailure {
+    /// Lists and documents have no order a key can carry.
+    Unordered
+}
+
+/// The key a tuple of values encodes to. The bytes order as the tuple does.
+///
+/// # Failures
+/// `.Unordered` when a value is a list or a document.
+public function encodeKey(values: borrow [Value]) -> Result<[UN8], KeyFailure> {
+    var key: [UN8] = []
+    for value in values { try key.appendKeyPart(value) }
+    return .Ok(key)
+}
+
+/// Writing key parts into a byte array.
+extend Array<UN8> {
+    /// Appends the key encoding of `value` to this array.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KeyFailure.Unordered` for a list or a document, which have no key order.
+    function appendKeyPart(borrow mut self, value: borrow Value) -> Result<Void, KeyFailure> {
+        match value {
+            Null -> self.append(code(KeyTag.Null))
+            Bool(truth) -> self.append(code(truth ? KeyTag.True : KeyTag.False))
+            Number(number) -> appendNumberKey(number)
+            Text(text) -> appendTextKey(text)
+            Bytes(bytes) -> {
+                self.append(code(KeyTag.Bytes))
+                appendEscaped(bytes)
+            }
+            List(_) -> return .Error(.Unordered)
+            Document(_) -> return .Error(.Unordered)
+        }
+        return .Ok
+    }
+
+    /// Appends `text` as a text key part.
+    function appendTextKey(borrow mut self, text: borrow String) {
+        self.append(code(KeyTag.Text))
+        appendEscaped(text.utf8())
+    }
+
+    /// Appends `bytes` with each zero byte escaped, then the terminator.
+    function appendEscaped(borrow mut self, bytes: borrow [UN8]) {
+        for byte in bytes {
+            self.append(byte)
+            if byte == KeyEscape.zero { self.append(KeyEscape.escapedZero) }
+        }
+        self.append(KeyEscape.zero)
+        self.append(KeyEscape.terminator)
+    }
+
+    /// Appends `number` as a number key part: a zero, a positive part, or a negative part whose body is complemented.
+    function appendNumberKey(borrow mut self, number: Number) {
+        if number == 0 {
+            self.append(code(KeyTag.Zero))
+            return
+        }
+        let body = positiveNumberBody(abs(number))
+        if number > 0 {
+            self.append(code(KeyTag.Positive))
+            appendAll(body)
+            return
+        }
+        self.append(code(KeyTag.Negative))
+        for byte in body { self.append(KeyEscape.largestByte - byte) }
+    }
+}
+
+/// The exponent and digits of a positive number (SPEC section 4).
+function positiveNumberBody(magnitude: Number) -> [UN8] {
+    let (exponent, digits) = decimalDigits(magnitude)
+    let biased = exponent + KeyEscape.exponentBias
+    var body: [UN8] = [UN8(floor(biased / KeyEscape.byteRange)), UN8(biased % KeyEscape.byteRange)]
+    for digit in digits { body.append(digit + KeyEscape.digitOffset) }
+    body.append(KeyEscape.digitEnd)
+    return body
+}
+
+/// `magnitude` as `0.d1 d2 ... dn x 10^exponent`, without leading or trailing
+/// zero digits, read off its decimal text.
+function decimalDigits(magnitude: Number) -> (Number, [UN8]) {
+    let zero = KeyText.zero
+    var digits: [UN8] = []
+    var leadingZeros: Number = 0
+    var wholeCount: Number? = .None
+    var seen: Number = 0
+    for byte in String(magnitude).utf8() {
+        if byte == KeyText.point {
+            wholeCount = .Some(seen)
+            continue
+        }
+        seen += 1
+        if digits.count == 0 && byte == zero {
+            leadingZeros += 1
+            continue
+        }
+        digits.append(byte - zero)
+    }
+    let whole = match wholeCount {
+        Some(count) -> count
+        None -> seen
+    }
+    return (whole - leadingZeros, trimmedZeros(digits))
+}
+
+/// Returns `digits` without the trailing zero digits.
+function trimmedZeros(digits: borrow [UN8]) -> [UN8] {
+    var end = digits.count
+    for index in 0..digits.count {
+        if digits[index] != 0 { end = index + 1 }
+    }
+    return digits.prefix(end)
+}

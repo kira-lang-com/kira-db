@@ -1,0 +1,191 @@
+//! Tests for sync between replicas and one server on loopback: mutations, optimistic views, failed mutations, lost transitions and refused credentials.
+import Foundation
+import KiraDB
+
+// Sync between replicas and one server on loopback: a mutation reaches the
+// other replica, a mutation shows at once offline, a failing mutation writes
+// nothing, a lost transition is applied once, and refused credentials end
+// the session. Each scenario answers its parts; each test checks them one by
+// one.
+
+/// One replica's mutation reaches another replica's subscription.
+function scenarioMutationReaches(rig: SyncRig) -> Result<[String], String> {
+    var open = rig
+    open.connect(0, .Text("ada"))
+    open.connect(1, .Text("alan"))
+    let watched = open.replicas[1].subscribe("todos", .Null)
+    try open.pump()
+    let before = open.shown(1, watched)
+    let number = try open.replicas[0].mutate(
+        "addTodo",
+        todo(1, "write spec")
+    ) otherwise return .Error("no mutate")
+    try open.pump()
+    let after = open.shown(1, watched)
+    return .Ok(["\(number)", before, after, "\(open.replicas[0].pending.count)"])
+}
+
+/// A mutation shows in the view at once while offline, and its answer arrives
+/// once the server has applied it.
+function scenarioOptimisticView(rig: SyncRig) -> Result<[String], String> {
+    var open = rig
+    let query = open.replicas[0].subscribe("todos", .Null)
+    try open.replicas[0].mutate("addTodo", todo(2, "offline")) otherwise return .Error("no mutate")
+    let offline = open.shown(0, query)
+    open.connect(0, .Text("ada"))
+    try open.pump()
+    let online = open.shown(0, query)
+    let ready = open.replicas[0].ready(query)
+    return .Ok(
+        [offline, online, "\(ready)", eventTexts(
+            open.replicas[0]
+        ), "\(open.replicas[0].pending.count)"]
+    )
+}
+
+/// A failing mutation writes nothing, on the server and in the view.
+function scenarioFailedMutation(rig: SyncRig) -> Result<[String], String> {
+    var open = rig
+    open.connect(0, .Text("ada"))
+    let query = open.replicas[0].subscribe("todos", .Null)
+    try open.replicas[0].mutate("addTodo", todo(3, "")) otherwise return .Error("no mutate")
+    let optimistic = open.shown(0, query)
+    try open.pump()
+    return .Ok([optimistic, open.shown(0, query), eventTexts(open.replicas[0])])
+}
+
+/// A mutation the server applied but whose transition was lost is sent again
+/// and applied once.
+function scenarioAppliedOnce(rig: SyncRig) -> Result<[String], String> {
+    var open = rig
+    open.connect(0, .Text("ada"))
+    open.connect(1, .Text("alan"))
+    let watched = open.replicas[1].subscribe("todos", .Null)
+    try open.pump()
+    try open.replicas[0].mutate("addTodo", todo(4, "once")) otherwise return .Error("no mutate")
+    for message in open.replicas[0].take() {
+        match open.server.receive(open.sessions[0], message) {
+            Ok -> {}
+            Error(failure) -> return .Error(traceText(failure))
+        }
+    }
+    var lost = 0
+    for outgoing in open.server.take() {
+        if outgoing.session == open.sessions[0] {
+            lost += 1
+            continue
+        }
+        match open.replicas[1].receive(outgoing.message) {
+            Ok -> {}
+            Error(failure) -> return .Error(traceText(failure))
+        }
+    }
+    open.drop(0)
+    open.connect(0, .Text("ada"))
+    try open.pump()
+    return .Ok(
+        ["\(lost)", eventTexts(open.replicas[0]), open.shown(
+            1,
+            watched
+        ), "\(open.replicas[0].pending.count)"]
+    )
+}
+
+/// Credentials the server refuses end the session.
+function scenarioRefusedSession(rig: SyncRig) -> Result<[String], String> {
+    var open = rig
+    open.connect(0, .Number(7))
+    try open.pump()
+    var reason = ""
+    for event in open.replicas[0].takeEvents() {
+        match event {
+            Refused(given) -> reason = given
+            Welcomed(_) -> {}
+            Done(_) -> {}
+            Changed(_) -> {}
+        }
+    }
+    return .Ok([reason, "\(open.server.ended(open.sessions[0]))"])
+}
+
+/// One replica's mutation reaches the other's subscription.
+@Test
+function mutationReachesTheOtherReplica() {
+    let parts = match withRig("sync-reach", 2, scenarioMutationReaches) {
+        Ok(found) -> found
+        Error(reason) -> {
+            expect!((reason) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "1")
+    expect!((parts[1]) == "[]")
+    expect!((parts[2]) == "[write spec]")
+    expect!((parts[3]) == "0")
+}
+
+/// A mutation shows offline at once, and its answer arrives once applied.
+@Test
+function offlineMutationShowsAtOnceAndIsAnswered() {
+    let parts = match withRig("sync-optimistic", 1, scenarioOptimisticView) {
+        Ok(found) -> found
+        Error(reason) -> {
+            expect!((reason) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "[offline]")
+    expect!((parts[1]) == "[offline]")
+    expect!((parts[2]) == "true")
+    expect!((parts[3].contains("SyncEvent.Done(")) == (true))
+    expect!((parts[3].contains("SyncEvent.Changed(")) == (true))
+    expect!((parts[4]) == "0")
+}
+
+/// A failing mutation is not in the view before or after it is answered.
+@Test
+function failedMutationWritesNothing() {
+    let parts = match withRig("sync-failed", 1, scenarioFailedMutation) {
+        Ok(found) -> found
+        Error(reason) -> {
+            expect!((reason) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "[]")
+    expect!((parts[1]) == "[]")
+    expect!((parts[2].contains("SyncEvent.Done(")) == (true))
+    expect!((parts[2].contains("empty text")) == (true))
+}
+
+/// A lost transition is sent again and applied once.
+@Test
+function lostTransitionIsAppliedOnce() {
+    let parts = match withRig("sync-once", 2, scenarioAppliedOnce) {
+        Ok(found) -> found
+        Error(reason) -> {
+            expect!((reason) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "1")
+    expect!((parts[1].contains("SyncEvent.Done(")) == (true))
+    expect!((parts[1].contains("MutationOutcome.Skipped")) == (true))
+    expect!((parts[2]) == "[once]")
+    expect!((parts[3]) == "0")
+}
+
+/// Credentials the server refuses are answered with the reason, and the
+/// session ends.
+@Test
+function refusedCredentialsEndTheSession() {
+    let parts = match withRig("sync-refused", 1, scenarioRefusedSession) {
+        Ok(found) -> found
+        Error(reason) -> {
+            expect!((reason) == "")
+            return
+        }
+    }
+    expect!((parts[0]) == "who are you")
+    expect!((parts[1]) == "true")
+}

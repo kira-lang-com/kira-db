@@ -1,0 +1,195 @@
+//! Reading rows: running a query against a table, through its plan.
+//!
+//! A query is planned with `planOf`, its candidate rows are read from the plan's
+//! source, and each candidate is kept when every condition holds. The kept rows are
+//! sorted, limited and projected. See SPEC sections 7.5 and 7.6.
+import Foundation
+
+/// Reading rows (SPEC sections 7.5 and 7.6).
+extend Database {
+    /// The rows `query` answers.
+    function select(borrow self, query: borrow Query) -> Result<[Document], TableFailure> {
+        match queryProblem(query) {
+            Some(problem) -> return .Error(.Query(problem))
+            // The query is valid for its table.
+            None -> {}
+        }
+        let plan = try planOf(query)
+        let candidates = try rowsOf(query.table, plan)
+        var kept: [Document] = []
+        for row in candidates {
+            let held = try allHold(query.conditions, row)
+            if held { kept.append(copy row) }
+        }
+        let sorted = try sortedRows(query, plan.source, move kept)
+        return .Ok(projectedRows(query, limitedRows(query, move sorted)))
+    }
+
+    /// The rows the plan's source holds between its keys, in its order.
+    function rowsOf(
+        borrow self,
+        table: borrow Table,
+        plan: borrow Plan
+    ) -> Result<[Document], TableFailure> {
+        let pairs = try rawScan(plan.start, plan.end)
+        var rows: [Document] = []
+        for pair in pairs {
+            let row = try sourceRow(table, plan.source, pair)
+            rows.append(row)
+        }
+        return .Ok(rows)
+    }
+
+    /// The row a pair the plan's source holds stands for.
+    function sourceRow(
+        borrow self,
+        table: borrow Table,
+        source: borrow Source,
+        pair: borrow KeyValue
+    ) -> Result<Document, TableFailure> {
+        return match source {
+            PrimaryKey -> rowOf(copy pair.value)
+            Index(position) -> indexedRow(table, position, pair.key)
+        }
+    }
+
+    /// The row an index entry names by its primary key, the entry's last values.
+    function indexedRow(
+        borrow self,
+        table: borrow Table,
+        position: UNumber,
+        entry: borrow [UN8]
+    ) -> Result<Document, TableFailure> {
+        let values = try decodeKey(copy entry)
+        let keyCount = table.schema.primaryKey.count
+        var key: [Value] = []
+        for index in values.count - keyCount..values.count { key.append(copy values[index]) }
+        let found = try row(table, key)
+        return match found {
+            Some(document) -> .Ok(document)
+            None -> .Error(.DanglingEntry(copy table.schema.indexes[position].name))
+        }
+    }
+}
+
+/// Returns whether every condition holds for `row`.
+///
+/// # Errors
+///
+/// Returns the failure of a comparison.
+function allHold(
+    conditions: borrow [Condition],
+    row: borrow Document
+) -> Result<Bool, TableFailure> {
+    for condition in conditions {
+        let held = try holds(condition, row)
+        if !held { return .Ok(false) }
+    }
+    return .Ok(true)
+}
+
+/// Returns whether at least one condition holds for `row`.
+///
+/// # Errors
+///
+/// Returns the failure of a comparison.
+function anyHolds(
+    conditions: borrow [Condition],
+    row: borrow Document
+) -> Result<Bool, TableFailure> {
+    for condition in conditions {
+        let held = try holds(condition, row)
+        if held { return .Ok(true) }
+    }
+    return .Ok(false)
+}
+
+/// Returns whether `condition` holds for `row`.
+///
+/// # Errors
+///
+/// Returns the failure of a comparison.
+function holds(condition: borrow Condition, row: borrow Document) -> Result<Bool, TableFailure> {
+    return match condition {
+        Compare(comparison) -> comparisonHolds(comparison, row)
+        IsNull(name) -> match row.field(name) {
+            Some(value) -> .Ok(value.isNull())
+            None -> .Ok(true)
+        }
+        AllOf(conditions) -> allHold(conditions, row)
+        AnyOf(conditions) -> anyHolds(conditions, row)
+    }
+}
+
+/// A comparison on an absent value is false (SPEC section 7.5).
+function comparisonHolds(
+    comparison: borrow Comparison,
+    row: borrow Document
+) -> Result<Bool, TableFailure> {
+    return match row.field(comparison.column) {
+        Some(held) -> heldValueHolds(comparison, held)
+        None -> .Ok(false)
+    }
+}
+
+/// Returns whether a comparison holds for a value the row holds.
+///
+/// A null value never satisfies a comparison.
+///
+/// # Errors
+///
+/// Returns the failure of encoding a value.
+function heldValueHolds(
+    comparison: borrow Comparison,
+    held: borrow Value
+) -> Result<Bool, TableFailure> {
+    if held.isNull() { return .Ok(false) }
+    let ordering = try keyOrder(held, comparison.value)
+    return .Ok(relationHolds(comparison.relation, ordering))
+}
+
+/// How two values order in key order (SPEC section 4).
+function keyOrder(left: borrow Value, right: borrow Value) -> Result<Ordering, TableFailure> {
+    let leftKey = try encodeKey([copy left])
+    let rightKey = try encodeKey([copy right])
+    return .Ok(compareKeys(leftKey, rightKey))
+}
+
+/// Returns whether `relation` holds for a value that orders as `ordering` against the comparison's value.
+function relationHolds(relation: borrow Relation, ordering: borrow Ordering) -> Bool {
+    return match relation {
+        Equal -> ordering == .Equal
+        NotEqual -> ordering != .Equal
+        Less -> ordering == .Less
+        LessOrEqual -> ordering != .Greater
+        Greater -> ordering == .Greater
+        GreaterOrEqual -> ordering != .Less
+    }
+}
+
+/// Returns at most the query's limit of the rows, or every row when the query has none.
+function limitedRows(query: borrow Query, rows: [Document]) -> [Document] {
+    return match query.limit {
+        Some(count) -> count < rows.count ? rows.prefix(count) : rows
+        None -> rows
+    }
+}
+
+/// Each row holding only the query's columns, in its order, when it names
+/// any.
+function projectedRows(query: borrow Query, rows: [Document]) -> [Document] {
+    if query.columns.count == 0 { return rows }
+    var projected: [Document] = []
+    for row in rows {
+        var kept = Document()
+        for name in query.columns {
+            match row.field(name) {
+                Some(value) -> kept.fields.append((copy name, value))
+                // An absent optional value stays absent.
+                None -> {}
+            }
+        }
+        projected.append(kept)
+    }
+    return projected
+}

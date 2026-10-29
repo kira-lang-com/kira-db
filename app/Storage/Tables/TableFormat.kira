@@ -1,0 +1,174 @@
+//! The byte format of a sorted table: its entries, its block handles, its footer,
+//! and the reading of each.
+//!
+//! The format is described in SPEC section 5.5. An entry is a length-prefixed key,
+//! a varint sequence, a kind byte, and for a put the length-prefixed value. A block
+//! handle is a length-prefixed last key and two varints. Each block and each index
+//! and filter block is followed by its checksum, and the footer names the filter and
+//! index and ends with the magic bytes.
+import Foundation
+
+/// SPEC section 5.5: the footer's four words, then the magic bytes.
+namespace TableFooter {
+    /// The magic bytes that end every table.
+    let magic: [UN8] = "KIRADB01".utf8()
+    /// Filter offset and length, index offset and length.
+    let words: UNumber = 4
+    /// The size of a footer in bytes.
+    let bytes: UNumber = TableFooter.words * BigEndian.wordBytes + TableFooter.magic.count
+}
+
+/// Where a data block sits, and the last key it holds.
+struct BlockHandle {
+    /// The last key the block holds.
+    let lastKey: [UN8]
+    /// The offset of the block in the table.
+    let offset: UNumber
+    /// The length of the block, not counting its checksum.
+    let length: UNumber
+}
+
+/// Where the filter and index blocks sit.
+struct Footer {
+    /// The filter block's offset and length.
+    let filter: (UNumber, UNumber)
+    /// The index block's offset and length.
+    let index: (UNumber, UNumber)
+}
+
+/// Writing a table's parts into a byte array.
+extend Array<UN8> {
+    /// SPEC section 5.5: key, sequence, kind, and for a put the value.
+    function appendEntry(borrow mut self, entry: borrow Entry) {
+        appendLengthPrefixed(entry.key)
+        appendVarint(entry.sequence)
+        match entry.version {
+            Put(value) -> {
+                self.append(code(VersionKind.Put))
+                appendLengthPrefixed(value)
+            }
+            Delete -> self.append(code(VersionKind.Delete))
+        }
+    }
+
+    /// Appends a block handle: its last key, its offset and its length.
+    function appendBlockHandle(borrow mut self, handle: borrow BlockHandle) {
+        appendLengthPrefixed(handle.lastKey)
+        appendVarint(handle.offset)
+        appendVarint(handle.length)
+    }
+
+    /// A block and its checksum, which its length does not count.
+    function appendChecked(borrow mut self, block: borrow [UN8]) {
+        appendAll(block)
+        appendWord(checksum(block))
+    }
+
+    /// Appends the footer: the filter and index offsets and lengths, then the magic bytes.
+    function appendFooter(borrow mut self, footer: borrow Footer) {
+        let (filterOffset, filterLength) = footer.filter
+        let (indexOffset, indexLength) = footer.index
+        appendWord(UN32(filterOffset))
+        appendWord(UN32(filterLength))
+        appendWord(UN32(indexOffset))
+        appendWord(UN32(indexLength))
+        appendAll(TableFooter.magic)
+    }
+}
+
+/// Reading a table's parts from bytes.
+extend ByteCursor {
+    /// Reads one entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode failure when the entry is malformed.
+    function readEntry(borrow mut self) -> Result<Entry, DecodeFailure> {
+        let key = try readLengthPrefixed()
+        let sequence = try readVarint()
+        let version = try readVersion()
+        return .Ok(Entry { key: key, sequence: sequence, version: version })
+    }
+
+    /// Reads a version's kind, and its value for a put.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownTag` for a kind byte that names neither a put nor a delete.
+    function readVersion(borrow mut self) -> Result<Version, DecodeFailure> {
+        let start = offset
+        let kind = try readByte()
+        return match fromCode<VersionKind>(kind) {
+            Put -> readPutVersion()
+            Delete -> .Ok(.Delete)
+            else -> .Error(.UnknownTag(start))
+        }
+    }
+
+    /// Reads the value of a put version.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode failure when the value is malformed.
+    function readPutVersion(borrow mut self) -> Result<Version, DecodeFailure> {
+        let value = try readLengthPrefixed()
+        return .Ok(.Put(value))
+    }
+
+    /// Reads one block handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode failure when the handle is malformed.
+    function readBlockHandle(borrow mut self) -> Result<BlockHandle, DecodeFailure> {
+        let lastKey = try readLengthPrefixed()
+        let blockOffset = try readVarint()
+        let length = try readVarint()
+        return .Ok(BlockHandle { lastKey: lastKey, offset: blockOffset, length: length })
+    }
+
+    /// Every entry up to the cursor's end.
+    function readEntries(borrow mut self) -> Result<[Entry], DecodeFailure> {
+        var entries: [Entry] = []
+        while !atEnd() {
+            let entry = try readEntry()
+            entries.append(entry)
+        }
+        return .Ok(entries)
+    }
+
+    /// Reads block handles up to the cursor's end.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode failure when a handle is malformed.
+    function readBlockHandles(borrow mut self) -> Result<[BlockHandle], DecodeFailure> {
+        var handles: [BlockHandle] = []
+        while !atEnd() {
+            let handle = try readBlockHandle()
+            handles.append(handle)
+        }
+        return .Ok(handles)
+    }
+
+    /// Reads a footer and checks its magic bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Corrupt` at the magic bytes' offset when they are not the table magic.
+    function readFooter(borrow mut self) -> Result<Footer, DecodeFailure> {
+        let filterOffset = try readWord()
+        let filterLength = try readWord()
+        let indexOffset = try readWord()
+        let indexLength = try readWord()
+        let start = offset
+        let magic = try readBytes(TableFooter.magic.count)
+        if magic != TableFooter.magic { return .Error(.Corrupt(start)) }
+        return .Ok(
+            Footer {
+                filter: (Number(filterOffset), Number(filterLength)),
+                index: (Number(indexOffset), Number(indexLength))
+            }
+        )
+    }
+}

@@ -1,0 +1,114 @@
+//! The write-ahead log: each batch of writes is appended to a log and synced before
+//! it is acknowledged, so a crash loses no acknowledged write.
+//!
+//! A record is a 4-byte payload length, its 4-byte CRC-32C checksum, and the payload
+//! (SPEC section 5.3). A record cut short by a crash, or failing its checksum, was
+//! never acknowledged, so reading a log stops there.
+import Foundation
+
+/// Why the storage engine could not do what it was asked.
+public enum StorageFailure {
+    /// The file system refused an operation on the file at this path, with the reason.
+    File((String, FileHandleFailure))
+    /// Stored bytes that do not read back, in the file at this path, with the reason.
+    Corrupt((String, DecodeFailure))
+    /// A whole-file operation (the manifest, a directory, a rename or a removal) failed.
+    FileSystem(FileFailure)
+    /// A manifest line does not read. Carries the line's number, counting from 1.
+    ManifestLine(UNumber)
+    /// The manifest names no log.
+    ManifestIncomplete
+}
+
+/// The conversion `try` makes when it passes a failure up.
+extend StorageFailure {
+    /// Returns the file-system failure as a `FileSystem` storage failure.
+    function from(failure: FileFailure) -> StorageFailure {
+        return .FileSystem(failure)
+    }
+}
+
+/// SPEC section 5.3: payload length, then its checksum, then the payload.
+namespace LogRecord {
+    /// The size of a record's header: its length and its checksum.
+    let headerBytes: UNumber = BigEndian.wordBytes * 2
+}
+
+/// The open end of a write-ahead log, which batches are appended to.
+struct LogWriter {
+    /// The log's file.
+    let file: StorageFile
+    /// The offset the next record is written at.
+    var end: UNumber
+
+    /// Writes `batch` as one record and syncs it, so it survives a crash once
+    /// this returns.
+    function append(borrow mut self, batch: borrow SequencedBatch) -> Result<Void, StorageFailure> {
+        var payload: [UN8] = []
+        payload.appendBatch(batch)
+        var record: [UN8] = []
+        record.appendWord(UN32(payload.count))
+        record.appendWord(checksum(payload))
+        record.appendAll(payload)
+        try file.write(end, record)
+        try file.sync()
+        end += record.count
+        return .Ok
+    }
+
+    /// Closes the log's file.
+    function close(borrow self) -> Result<Void, StorageFailure> {
+        return file.close()
+    }
+}
+
+/// A new, empty log at `path`.
+function createLog(path: borrow String) -> Result<LogWriter, StorageFailure> {
+    let file = try openStorageFile(path, .CreateNew)
+    return .Ok(LogWriter { file: file, end: 0 })
+}
+
+/// Every acknowledged batch in the log at `path`, in the order written.
+function readLog(path: borrow String) -> Result<[SequencedBatch], StorageFailure> {
+    let file = try openStorageFile(path, .Read)
+    let read = file.readWhole()
+    try file.close()
+    let bytes = try read
+    return loggedBatches(move bytes, path)
+}
+
+/// The batches of a log's bytes. A record cut short or failing its checksum
+/// was never acknowledged, so it and everything after it are dropped; a record
+/// whose checksum holds but whose batch does not read is corruption.
+function loggedBatches(
+    bytes: [UN8],
+    path: borrow String
+) -> Result<[SequencedBatch], StorageFailure> {
+    var cursor = ByteCursor { bytes: bytes }
+    var batches: [SequencedBatch] = []
+    while true {
+        match nextPayload(cursor) {
+            Some(payload) -> {
+                var reader = ByteCursor { bytes: payload }
+                match reader.readBatch() {
+                    Ok(batch) -> batches.append(batch)
+                    Error(failure) -> return .Error(.Corrupt((copy path, move failure)))
+                }
+            }
+            None -> return .Ok(batches)
+        }
+    }
+}
+
+/// The next record's payload, when the record is whole and its checksum holds.
+function nextPayload(cursor: borrow mut ByteCursor) -> [UN8]? {
+    // Every record read is how a log ends, and nothing went wrong.
+    if cursor.atEnd() { return .None }
+    // A record cut short is the end of the log, not a failure: a crash
+    // stopped its write before it was acknowledged.
+    let length = try cursor.readWord() otherwise return .None
+    let expected = try cursor.readWord() otherwise return .None
+    let payload = try cursor.readBytes(length) otherwise return .None
+    if checksum(payload) != expected { return .None }
+    return .Some(payload)
+}

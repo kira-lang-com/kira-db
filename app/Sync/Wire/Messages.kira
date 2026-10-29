@@ -1,0 +1,110 @@
+//! The sync protocol's messages: what a client sends and what a server answers, as enums.
+import Foundation
+
+/// What a client sends (SPEC section 8.3): a hello, a subscription or its end, or a mutation.
+public enum ClientMessage {
+    /// Starts a session: the client's number and its credentials.
+    Hello(Hello)
+    /// Asks the server to keep a query's result in view, under the number `query`.
+    Subscribe(Subscribe)
+    /// Ends the subscription with this number.
+    Unsubscribe(Number)
+    /// Asks the server to run a mutation.
+    Mutate(Mutate)
+}
+
+/// The first message of a session.
+public struct Hello {
+    /// The client's number, or 0 for a client the server never named.
+    let client: Number
+    /// The credentials the server's `authenticate` checks.
+    let credentials: Value
+}
+
+/// A subscription to a query.
+public struct Subscribe {
+    /// The number the client gives the subscription.
+    let query: Number
+    /// The name of the query function.
+    let name: String
+    /// The arguments the query is run with.
+    let arguments: Value
+}
+
+/// A mutation the client asks the server to run.
+public struct Mutate {
+    /// The mutation's number in the client's own sequence, so the server applies each one once and in order.
+    let number: Number
+    /// The name of the mutation function.
+    let name: String
+    /// The arguments the mutation is run with.
+    let arguments: Value
+}
+
+/// What the server sends (SPEC section 8.3).
+public enum ServerMessage {
+    /// The session is open, for the caller the server made.
+    Welcome(Caller)
+    /// The server refused the session or a message, with the reason.
+    Refused(String)
+    /// The replica's next state.
+    SyncTransition(SyncTransition)
+}
+
+/// The change from one state of the client's view to the next.
+public struct SyncTransition {
+    /// The version of the view this transition takes the replica to.
+    let version: Number
+    /// The number of the last mutation the server has applied for this client.
+    let applied: Number
+    /// The key-range changes to apply, in order.
+    let changes: [Change]
+    /// The subscriptions whose results are now complete in the view.
+    let ready: [Number]
+    /// The outcomes of the mutations this transition answers.
+    let results: [MutationResult]
+}
+
+/// One change to the client's copy of the database.
+public enum Change {
+    /// A put, or a delete when the value is `None`.
+    Write(Written)
+    /// The range now holds exactly these pairs. Keys in the range that are not among them are not held.
+    Hold(Held)
+    /// The range is no longer held by the client.
+    Release(KeyRange)
+}
+
+/// One key written, with its value, or none when the key is deleted.
+public struct Written {
+    /// The key's bytes.
+    let key: [UN8]
+    /// The value's bytes, or `.None` when the key is deleted.
+    let value: [UN8]?
+}
+
+/// A key range the client holds, and the pairs it holds in it.
+public struct Held {
+    /// The key range held.
+    let range: KeyRange
+    /// Every key and value in the range.
+    let pairs: [KeyValue]
+}
+
+/// The outcome of one mutation the client sent.
+public struct MutationResult {
+    /// The client's number for the mutation.
+    let number: Number
+    /// What became of the mutation.
+    let outcome: MutationOutcome
+}
+
+/// What became of a mutation.
+public enum MutationOutcome {
+    /// The mutation ran and answered this value.
+    Answered(Value)
+    /// The mutation failed and wrote nothing. Carries the reason.
+    Failed(String)
+    /// The mutation was applied in an earlier session, so it is not run again.
+    Skipped
+}

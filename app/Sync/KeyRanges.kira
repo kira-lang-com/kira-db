@@ -1,0 +1,96 @@
+//! Sets of keys, kept as sorted lists of ranges.
+//!
+//! A set of keys is a list of disjoint ranges that do not touch, in key order. A set
+//! is built from ranges by merging overlapping ones, and the union and difference of
+//! sets are computed from their ranges (SPEC section 8.4).
+import Foundation
+
+/// A set of keys as a sorted list of disjoint, non-touching ranges (SPEC
+/// section 8.4).
+struct KeyRanges {
+    /// The ranges of the set, in key order.
+    var ranges: [KeyRange] = []
+
+    /// Returns whether `key` lies in the set.
+    function contains(borrow self, key: borrow [UN8]) -> Bool {
+        for range in ranges {
+            if compareKeys(key, range.start) == .Less { return false }
+            if compareKeys(key, range.end) == .Less { return true }
+        }
+        return false
+    }
+
+    /// Whether any key `writes` touch lies in the set.
+    function touches(borrow self, writes: borrow [Write]) -> Bool {
+        for write in writes {
+            if contains(writtenKey(write)) { return true }
+        }
+        return false
+    }
+
+    /// Returns whether the set holds no key.
+    function isEmpty(borrow self) -> Bool {
+        return ranges.count == 0
+    }
+}
+
+/// The set holding every key of `ranges`.
+function rangesOf(ranges: borrow [KeyRange]) -> KeyRanges {
+    let sorted = ranges.sorted({ left, right in compareKeys(left.start, right.start) == .Less })
+    var merged: [KeyRange] = []
+    for range in sorted {
+        if compareKeys(range.start, range.end) != .Less { continue }
+        if merged.count > 0 {
+            let last = merged[merged.count - 1]
+            if compareKeys(range.start, last.end) != .Greater {
+                if compareKeys(range.end, last.end) == .Greater {
+                    merged[merged.count - 1] = KeyRange {
+                        start: copy last.start,
+                        end: copy range.end
+                    }
+                }
+                continue
+            }
+        }
+        merged.append(copy range)
+    }
+    return KeyRanges { ranges: merged }
+}
+
+/// Returns the set of keys in either `left` or `right`.
+function unionOf(left: borrow KeyRanges, right: borrow KeyRanges) -> KeyRanges {
+    var all = copy left.ranges
+    for range in right.ranges { all.append(copy range) }
+    return rangesOf(all)
+}
+
+/// The maximal ranges of `left` outside `right`.
+function differenceOf(left: borrow KeyRanges, right: borrow KeyRanges) -> KeyRanges {
+    var kept: [KeyRange] = []
+    for range in left.ranges {
+        var start = copy range.start
+        for cut in right.ranges {
+            if compareKeys(cut.end, start) != .Greater { continue }
+            if compareKeys(cut.start, range.end) != .Less { break }
+            if compareKeys(start, cut.start) == .Less {
+                kept.append(KeyRange { start: copy start, end: copy cut.start })
+            }
+            start = copy cut.end
+        }
+        if compareKeys(start, range.end) == .Less {
+            kept.append(KeyRange { start: start, end: copy range.end })
+        }
+    }
+    return KeyRanges { ranges: kept }
+}
+
+/// Returns the key a write changes.
+function writtenKey(write: borrow Write) -> [UN8] {
+    return match write {
+        Put(entry) -> {
+            let (key, _) = entry
+            copy key
+        }
+        Delete(key) -> copy key
+    }
+}

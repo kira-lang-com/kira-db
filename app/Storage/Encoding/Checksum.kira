@@ -1,0 +1,51 @@
+//! CRC-32C checksums for log records and table blocks.
+//!
+//! A checksum is stored after each block, so a corrupted block is detected when it is
+//! read. The polynomial and the table are the ones SPEC sections 5.3 and 5.5 name.
+import Foundation
+
+/// CRC-32C (Castagnoli), the checksum SPEC sections 5.3 and 5.5 put on every
+/// log record and table block. Reflected, one table lookup per byte.
+namespace Crc32c {
+    /// The Castagnoli polynomial, bit-reversed (RFC 3720 appendix B.4).
+    let polynomial: UN32 = 0x82f63b78
+    /// Every bit set: the register's start, and the mask its end is inverted with.
+    let inverted: UN32 = 0xffffffff
+    /// The mask that keeps one byte of a value.
+    let byteMask: UN32 = 0xff
+    /// The number of bits in a byte.
+    let byteBits: UNumber = 8
+    /// The number of values one byte holds.
+    let byteValues: UNumber = 256
+    /// The remainder each byte value leaves, worked out while compiling.
+    let table: [UN32] = remainderTable()
+}
+
+/// Returns the remainder of every byte value, for the checksum's lookup table.
+comptime function remainderTable() -> [UN32] {
+    var table: [UN32] = []
+    for byte in 0..Crc32c.byteValues { table.append(byteRemainder(UN32(byte))) }
+    return table
+}
+
+/// The remainder of one byte value, shifted out a bit at a time.
+function byteRemainder(byte: UN32) -> UN32 {
+    var remainder = byte
+    for _ in 0..Crc32c.byteBits {
+        remainder = match remainder % 2 {
+            0 -> remainder >> 1
+            else -> (remainder >> 1) ^ Crc32c.polynomial
+        }
+    }
+    return remainder
+}
+
+/// The CRC-32C of `bytes`, which stored blocks carry to detect corruption.
+public function checksum(bytes: borrow [UN8]) -> UN32 {
+    var register = Crc32c.inverted
+    for byte in bytes {
+        let index = (register ^ byte) & Crc32c.byteMask
+        register = Crc32c.table[index] ^ (register >> 8)
+    }
+    return register ^ Crc32c.inverted
+}

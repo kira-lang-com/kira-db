@@ -1,0 +1,289 @@
+//! Applying what the server sends to a replica's local database, and rebuilding the
+//! view the application reads.
+//!
+//! The view is the stored database with the pending mutations run over it again. A
+//! transition from the server first changes the stored data, then clears the
+//! pending mutations the server has applied, then rebuilds the view (SPEC section
+//! 8.5).
+import Foundation
+
+// The view and transitions of SPEC section 8.5.
+/// Applying the server's messages to the replica, and rebuilding the view.
+extend Replica {
+    // Writes `batch` to the replica's store. The view's recorded run ends
+    // first, so the batch is not held in it; the caller rebuilds the view.
+    /// Writes `batch` to the replica's store, with the view's recorded run ended first, so the batch is not held in it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the write.
+    function writeStored(borrow mut self, batch: borrow WriteBatch) -> Result<Void, SyncFailure> {
+        database.endRecording()
+        try database.writeBatch(batch)
+        return .Ok
+    }
+
+    // Runs the pending mutations again over the stored replica, as one
+    // recorded run that stays open, and reports what changed.
+    /// Runs the pending mutations again over the stored replica, as one recorded run that stays open, and reports which queries changed.
+    function rebuildView(borrow mut self) {
+        database.endRecording()
+        database.beginRecording()
+        for mutation in pending {
+            match database.mutationAnswer(functions, mutation.name, caller, mutation.arguments) {
+                // Its writes are in the view.
+                Ok(_) -> {}
+                // A failed pending mutation holds no writes.
+                Error(failure) -> {}
+            }
+        }
+        reportChanges()
+    }
+
+    /// Returns the answer of the query `name` over the view, and forgets the key ranges it read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the query's own failure, or `.NoSuchFunction`.
+    function viewAnswer(
+        borrow mut self,
+        name: borrow String,
+        arguments: borrow Value
+    ) -> Result<Value, FunctionFailure> {
+        let answer = database.queryAnswer(functions, name, caller, arguments)
+        database.forgetReads()
+        return answer
+    }
+
+    // `Changed` for every query whose result over the view differs from the
+    // one last reported.
+    /// Reports a `Changed` event for every subscription whose result over the view differs from the one last reported.
+    function reportChanges(borrow mut self) {
+        for index in 0..subscriptions.count {
+            let subscription = subscriptions[index]
+            let shown = traceText(viewAnswer(subscription.name, subscription.arguments))
+            if shown == subscription.shown { continue }
+            subscriptions[index].shown = shown
+            events.append(.Changed(subscription.query))
+        }
+    }
+
+    /// Applies a transition: its changes to the stored data, the readiness of the queries it names, the pending mutations it has applied, and its results. Then it rebuilds the view.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of a write or a scan.
+    function apply(
+        borrow mut self,
+        transition: borrow SyncTransition
+    ) -> Result<Void, SyncFailure> {
+        database.endRecording()
+        // A recorded run gives one write per key, so a range a `hold` clears
+        // and fills again writes each key once.
+        database.beginRecording()
+        try applyChanges(transition.changes)
+        for query in transition.ready { markReady(query) }
+        var kept: [PendingMutation] = []
+        var batch = WriteBatch()
+        for mutation in pending {
+            if mutation.number > transition.applied {
+                kept.append(copy mutation)
+            } else {
+                batch.delete(syncNumberKey("pending", mutation.number))
+            }
+        }
+        if allReady() {
+            for range in differenceOf(stale, held).ranges { try clearRange(range) }
+            stale = KeyRanges()
+        }
+        batch.put(syncKey("version"), encodeValue(.Number(transition.version)))
+        batch.put(syncKey("held"), heldValue(unionOf(held, stale)))
+        try database.writeBatch(batch)
+        let run = database.endRecording()
+        try database.writeBatch(run.batch)
+        pending = kept
+        for result in transition.results { events.append(.Done(copy result)) }
+        rebuildView()
+        return .Ok
+    }
+
+    /// Applies `changes` in order: writes, held ranges and released ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of a scan or a write.
+    function applyChanges(borrow mut self, changes: borrow [Change]) -> Result<Void, SyncFailure> {
+        for change in changes {
+            match change {
+                Write(written) -> {
+                    var batch = WriteBatch()
+                    match written.value {
+                        Some(value) -> batch.put(copy written.key, copy value)
+                        None -> batch.delete(copy written.key)
+                    }
+                    try database.writeBatch(batch)
+                }
+                Hold(given) -> {
+                    try clearRange(given.range)
+                    var batch = WriteBatch()
+                    for pair in given.pairs { batch.put(copy pair.key, copy pair.value) }
+                    try database.writeBatch(batch)
+                    held = unionOf(held, rangesOf([copy given.range]))
+                }
+                Release(range) -> {
+                    try clearRange(range)
+                    held = differenceOf(held, rangesOf([copy range]))
+                }
+            }
+        }
+        return .Ok
+    }
+
+    /// Deletes every stored key in `range`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the scan or the write.
+    function clearRange(borrow mut self, range: borrow KeyRange) -> Result<Void, SyncFailure> {
+        let pairs = try database.scanKeys(range.start, range.end)
+        var batch = WriteBatch()
+        for pair in pairs { batch.delete(copy pair.key) }
+        try database.writeBatch(batch)
+        return .Ok
+    }
+
+    /// Marks the subscription with this number as ready.
+    function markReady(borrow mut self, query: Number) {
+        for index in 0..subscriptions.count {
+            if subscriptions[index].query == query { subscriptions[index].ready = true }
+        }
+    }
+
+    /// Returns whether every subscription is ready.
+    function allReady(borrow self) -> Bool {
+        for subscription in subscriptions {
+            if !subscription.ready { return false }
+        }
+        return true
+    }
+}
+
+/// Returns the held ranges encoded as the list of start and end documents stored under the held key.
+function heldValue(ranges: borrow KeyRanges) -> [UN8] {
+    var list: [Value] = []
+    for range in ranges.ranges {
+        var document = Document()
+        document.set("start", .Bytes(copy range.start))
+        document.set("end", .Bytes(copy range.end))
+        list.append(.Document(document))
+    }
+    return encodeValue(.List(list))
+}
+
+/// The replica in `directory`, created when the directory holds none, and reloaded with its stored client number, identity and pending mutations otherwise.
+///
+/// # Failures
+/// `.Database` when the database cannot be opened, `.Corrupt` when stored sync state does not read back.
+public function openReplica(
+    directory: borrow String,
+    functions: Functions
+) -> Result<Replica, SyncFailure> {
+    var database = try openDatabase(directory)
+    let client = try database.storedNumber(syncKey("client"), 0)
+    let next = try database.storedNumber(syncKey("next-mutation"), 1)
+    let identity = try storedValue(database, syncKey("identity"))
+    let held = try storedHeld(database)
+    let pending = try storedPending(database)
+    var replica = Replica {
+        database: database,
+        functions: functions,
+        caller: Caller { client: client, identity: identity },
+        nextMutation: next,
+        pending: pending,
+        held: held
+    }
+    replica.rebuildView()
+    return .Ok(replica)
+}
+
+/// Returns the value stored under `key`, or `.Null` when none is stored.
+///
+/// # Errors
+///
+/// Returns the failure of the read or of decoding.
+function storedValue(database: borrow Database, key: borrow [UN8]) -> Result<Value, SyncFailure> {
+    let found = try database.readKey(key)
+    return match found {
+        Some(bytes) -> valueIn(move bytes)
+        None -> .Ok(.Null)
+    }
+}
+
+/// Decodes the stored bytes of a value.
+///
+/// # Errors
+///
+/// Returns the decode failure.
+function valueIn(bytes: [UN8]) -> Result<Value, SyncFailure> {
+    let value = try decodeValue(move bytes)
+    return .Ok(value)
+}
+
+/// Returns the key ranges stored as held.
+///
+/// # Errors
+///
+/// Returns `Malformed` when the stored ranges do not read back.
+function storedHeld(database: borrow Database) -> Result<KeyRanges, SyncFailure> {
+    let stored = try storedValue(database, syncKey("held"))
+    if stored.isNull() { return .Ok(KeyRanges()) }
+    let values = match stored.list() {
+        Some(values) -> values
+        None -> return .Error(.Malformed)
+    }
+    var ranges: [KeyRange] = []
+    for value in values {
+        let range = match value.document() {
+            Some(document) -> rangeOf(document)
+            None -> return .Error(.Malformed)
+        }
+        match range {
+            Ok(read) -> ranges.append(read)
+            Error(failure) -> return .Error(.Malformed)
+        }
+    }
+    return .Ok(rangesOf(ranges))
+}
+
+/// Returns the pending mutations stored in the database.
+///
+/// # Errors
+///
+/// Returns `Malformed` when a stored mutation does not read back.
+function storedPending(database: borrow Database) -> Result<[PendingMutation], SyncFailure> {
+    let prefix = syncKey("pending")
+    let pairs = try database.scanKeys(prefix, pastPrefix(prefix))
+    var pending: [PendingMutation] = []
+    for pair in pairs {
+        let keyPart = try decodeLastKeyPart(pair.key, prefix.count)
+        let number = match keyPart.number() {
+            Some(number) -> number
+            None -> return .Error(.Malformed)
+        }
+        let stored = try valueIn(copy pair.value)
+        let document = match stored.document() {
+            Some(document) -> document
+            None -> return .Error(.Malformed)
+        }
+        let name = match document.textField("name") {
+            Some(name) -> name
+            None -> return .Error(.Malformed)
+        }
+        let arguments = match document.field("arguments") {
+            Some(arguments) -> arguments
+            None -> return .Error(.Malformed)
+        }
+        pending.append(PendingMutation { number: number, name: name, arguments: arguments })
+    }
+    return .Ok(pending)
+}

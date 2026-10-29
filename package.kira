@@ -1,0 +1,6 @@
+//! KiraDB: an embedded store for key-value data, documents and tables, with a sync protocol that keeps replicas in step.
+/// The KiraDB library: the store, the table and document layers, and the sync client and server.
+construct KiraDB extends Package {
+    let version: String = "26.10.4"
+    let kind: PackageKind = .Library
+}

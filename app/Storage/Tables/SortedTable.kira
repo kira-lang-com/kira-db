@@ -1,0 +1,304 @@
+//! Sorted tables: immutable files of key-ordered entries, read a block at a time.
+//!
+//! A table is a run of data blocks, then a Bloom filter over its keys, then an
+//! index of block handles, then a footer that locates the filter and the index.
+//! Opening a table reads the footer, the filter and the index. The data blocks are
+//! read on demand. Every block carries a checksum, and a failed checksum or a
+//! malformed block is reported as a corruption of the file.
+import Foundation
+
+/// The bytes of a sorted table holding `entries`, which are in key ascending,
+/// sequence descending order (SPEC section 5.5).
+function encodeTable(entries: borrow [Entry]) -> [UN8] {
+    var bytes: [UN8] = []
+    var handles: [BlockHandle] = []
+    var keys: [[UN8]] = []
+    var block: [UN8] = []
+    for entry in entries {
+        block.appendEntry(entry)
+        if keys.count == 0 || keys[keys.count - 1] != entry.key { keys.append(copy entry.key) }
+        if block.count >= Tuning.blockBytes {
+            handles.append(
+                BlockHandle { lastKey: copy entry.key, offset: bytes.count, length: block.count }
+            )
+            bytes.appendChecked(block)
+            block = []
+        }
+    }
+    if block.count > 0 {
+        handles.append(
+            BlockHandle {
+                lastKey: copy keys[keys.count - 1],
+                offset: bytes.count,
+                length: block.count
+            }
+        )
+        bytes.appendChecked(block)
+    }
+    return tableTail(move bytes, handles, keys)
+}
+
+/// The data blocks in `bytes` followed by the filter, index and footer.
+function tableTail(bytes: [UN8], handles: borrow [BlockHandle], keys: borrow [[UN8]]) -> [UN8] {
+    var table = bytes
+    var filter: [UN8] = []
+    filter.appendFilter(buildFilter(keys))
+    let filterAt = (table.count, filter.count)
+    table.appendChecked(filter)
+    var index: [UN8] = []
+    for handle in handles { index.appendBlockHandle(handle) }
+    let indexAt = (table.count, index.count)
+    table.appendChecked(index)
+    table.appendFooter(Footer { filter: filterAt, index: indexAt })
+    return table
+}
+
+/// An open sorted table: its index and filter in memory, its blocks read on
+/// demand.
+struct SortedTable {
+    /// The file the table is stored in.
+    let file: StorageFile
+    /// The handle of each data block, in key order.
+    let handles: [BlockHandle]
+    /// The filter over the table's keys, which answers before any block is read.
+    let filter: BloomFilter
+
+    /// The newest version of `key` at or below `snapshot`, if the table has one.
+    /// `kept` holds the blocks of the table numbered `table` that earlier
+    /// reads checked.
+    function find(
+        borrow self,
+        key: borrow [UN8],
+        snapshot: UNumber,
+        kept: borrow KeptBlocks,
+        table: UNumber
+    ) -> Result<Version?, StorageFailure> {
+        if !filter.mayHold(key) { return .Ok(.None) }
+        // A key's versions can run on past one block, so the scan starts at
+        // the first block that may hold it and goes on until a larger key.
+        for index in firstBlock(key)..handles.count {
+            let scan = match try scanBlock(index, key, snapshot, kept, table) {
+                Ok(scan) -> scan
+                Error(failure) -> return .Error(file.corrupt(move failure))
+            }
+            match scan {
+                Found(version) -> return .Ok(.Some(version))
+                Past -> return .Ok(.None)
+                // The next block may hold more of the key's versions.
+                Continues -> continue
+            }
+        }
+        return .Ok(.None)
+    }
+
+    /// Where block `index`'s scan for `key` ended, the block read from the
+    /// kept blocks when they hold it.
+    function scanBlock(
+        borrow self,
+        index: UNumber,
+        key: borrow [UN8],
+        snapshot: UNumber,
+        kept: borrow KeptBlocks,
+        table: UNumber
+    ) -> Result<Result<Scan, DecodeFailure>, StorageFailure> {
+        match kept.kept(table, index) {
+            Some(block) -> return .Ok(newestIn(block.bytes, key, snapshot))
+            None -> {}
+        }
+        let block = try readChecked(file, handles[index].offset, handles[index].length)
+        let scan = newestIn(block, key, snapshot)
+        var keeping = kept
+        keeping.keep(KeptBlock { table: table, number: index, bytes: move block })
+        return .Ok(scan)
+    }
+
+    /// Every entry, in order.
+    function entries(borrow self) -> Result<[Entry], StorageFailure> {
+        var all: [Entry] = []
+        for handle in handles {
+            let entries = try readBlock(handle)
+            all.appendAll(entries)
+        }
+        return .Ok(all)
+    }
+
+    /// The entries whose keys lie from `start` up to, not including, `end`.
+    function entriesIn(
+        borrow self,
+        start: borrow [UN8],
+        end: borrow [UN8]
+    ) -> Result<[Entry], StorageFailure> {
+        var found: [Entry] = []
+        for index in firstBlock(start)..handles.count {
+            let entries = try readBlock(handles[index])
+            for entry in entries {
+                if compareKeys(entry.key, end) != .Less { return .Ok(found) }
+                if compareKeys(entry.key, start) != .Less { found.append(copy entry) }
+            }
+        }
+        return .Ok(found)
+    }
+
+    /// The first block whose last key is not below `key`.
+    function firstBlock(borrow self, key: borrow [UN8]) -> UNumber {
+        var low: UNumber = 0
+        var high = handles.count
+        while low < high {
+            let middle = floor((low + high) / 2)
+            match compareKeys(handles[middle].lastKey, key) {
+                Less -> low = middle + 1
+                Equal -> high = middle
+                Greater -> high = middle
+            }
+        }
+        return low
+    }
+
+    /// Reads and decodes the entries of one data block.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the read, or the corruption of a block that does not decode.
+    function readBlock(borrow self, handle: borrow BlockHandle) -> Result<[Entry], StorageFailure> {
+        let block = try readChecked(file, handle.offset, handle.length)
+        var cursor = ByteCursor { bytes: block }
+        return match cursor.readEntries() {
+            Ok(entries) -> .Ok(entries)
+            Error(failure) -> .Error(file.corrupt(move failure))
+        }
+    }
+
+    /// Closes the file the table is stored in.
+    function close(borrow self) -> Result<Void, StorageFailure> {
+        return file.close()
+    }
+}
+
+/// Where a block's scan for a key ended.
+enum Scan {
+    /// The newest version of the key in this block.
+    Found(Version)
+    /// A larger key came first: the table has no version to give.
+    Past
+    /// The block ended before a larger key: the next block may hold more.
+    Continues
+}
+
+/// The newest version of `key` at or below `snapshot` in `block`, read where
+/// it lies: only the value found is copied out.
+function newestIn(
+    block: borrow [UN8],
+    key: borrow [UN8],
+    snapshot: UNumber
+) -> Result<Scan, DecodeFailure> {
+    var cursor = ByteCursor { bytes: copy block }
+    while !cursor.atEnd() {
+        let ordering = try cursor.compareLengthPrefixed(key)
+        let sequence = try cursor.readVarint()
+        let start = cursor.offset
+        let kind = try cursor.readByte()
+        let found = match ordering {
+            Less -> false
+            Equal -> sequence <= snapshot
+            Greater -> return .Ok(.Past)
+        }
+        match fromCode<VersionKind>(kind) {
+            Put -> {
+                if !found {
+                    try cursor.skipLengthPrefixed()
+                    continue
+                }
+                let value = try cursor.readLengthPrefixed()
+                return .Ok(.Found(.Put(value)))
+            }
+            Delete -> {
+                if found { return .Ok(.Found(.Delete)) }
+            }
+            else -> return .Error(.UnknownTag(start))
+        }
+    }
+    return .Ok(.Continues)
+}
+
+/// The `length` bytes at `offset`, checked against the checksum after them.
+function readChecked(
+    file: borrow StorageFile,
+    offset: UNumber,
+    length: UNumber
+) -> Result<[UN8], StorageFailure> {
+    let bytes = try file.read(offset, length + BigEndian.wordBytes)
+    return match checkedBlock(move bytes, length, offset) {
+        Ok(block) -> .Ok(block)
+        Error(failure) -> .Error(file.corrupt(move failure))
+    }
+}
+
+/// The block at the front of `bytes`, when the checksum after it holds.
+function checkedBlock(
+    bytes: [UN8],
+    length: UNumber,
+    offset: UNumber
+) -> Result<[UN8], DecodeFailure> {
+    var cursor = ByteCursor { bytes: bytes }
+    let block = try cursor.readBytes(length)
+    let expected = try cursor.readWord()
+    if checksum(block) != expected { return .Error(.Corrupt(offset)) }
+    return .Ok(block)
+}
+
+/// Writes `entries` as a new sorted table at `path`, synced, and answers its
+/// size in bytes.
+function writeTable(
+    path: borrow String,
+    entries: borrow [Entry]
+) -> Result<UNumber, StorageFailure> {
+    let bytes = encodeTable(entries)
+    try writeNewFile(path, bytes)
+    return .Ok(bytes.count)
+}
+
+/// The sorted table at `path`, its footer, filter and index read.
+function openTable(path: borrow String) -> Result<SortedTable, StorageFailure> {
+    let file = try openStorageFile(path, .Read)
+    let size = try file.size()
+    if size < TableFooter.bytes { return .Error(file.corrupt(.Truncated(size))) }
+    let footerBytes = try file.read(size - TableFooter.bytes, TableFooter.bytes)
+    var cursor = ByteCursor { bytes: footerBytes }
+    return match cursor.readFooter() {
+        Ok(footer) -> tableAt(move file, footer)
+        Error(failure) -> .Error(file.corrupt(move failure))
+    }
+}
+
+/// The table in `file`, its filter and index read where the footer says.
+function tableAt(file: StorageFile, footer: borrow Footer) -> Result<SortedTable, StorageFailure> {
+    let (filterOffset, filterLength) = footer.filter
+    let (indexOffset, indexLength) = footer.index
+    let filterBlock = try readChecked(file, filterOffset, filterLength)
+    let indexBlock = try readChecked(file, indexOffset, indexLength)
+    return match tableParts(move filterBlock, move indexBlock) {
+        Ok(parts) -> .Ok(SortedTable { file: file, handles: parts.handles, filter: parts.filter })
+        Error(failure) -> .Error(file.corrupt(move failure))
+    }
+}
+
+/// A table's filter and block handles.
+struct TableParts {
+    /// The handle of each data block.
+    let handles: [BlockHandle]
+    /// The table's filter.
+    let filter: BloomFilter
+}
+
+/// Decodes a table's filter block and index block.
+///
+/// # Errors
+///
+/// Returns a decode failure when either block is malformed.
+function tableParts(filterBlock: [UN8], indexBlock: [UN8]) -> Result<TableParts, DecodeFailure> {
+    var filterCursor = ByteCursor { bytes: filterBlock }
+    let filter = try filterCursor.readFilter()
+    var indexCursor = ByteCursor { bytes: indexBlock }
+    let handles = try indexCursor.readBlockHandles()
+    return .Ok(TableParts { handles: handles, filter: filter })
+}

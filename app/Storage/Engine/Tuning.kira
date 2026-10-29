@@ -1,0 +1,25 @@
+//! The sizes and counts of the storage engine, which SPEC section 5 leaves to tuning.
+//!
+//! Each value is a single place to change a size, and the rest of the engine reads
+//! it from here.
+import Foundation
+
+/// The sizes and counts SPEC section 5 leaves to tuning.
+namespace Tuning {
+    /// A memory table past this many bytes is written out as a sorted table.
+    let memoryTableBytes: UNumber = 4194304
+    /// A data block closes once it passes this many bytes.
+    let blockBytes: UNumber = 4096
+    /// A store keeps this many data blocks its point reads checked: 8 MiB of
+    /// 4 KiB blocks.
+    let cachedBlocks: UNumber = 2048
+    /// Ten bits and seven probes a key give a Bloom filter about one false
+    /// positive in a hundred.
+    let filterBitsPerKey: UNumber = 10
+    /// The bits each key sets in a Bloom filter.
+    let filterProbes: UNumber = 7
+    /// Level 0 merges into level 1 once it holds this many tables.
+    let levelZeroTables: UNumber = 4
+    /// Level 1's size before it merges down; each deeper level holds ten times more.
+    let levelBytes: UNumber = 10485760
+}

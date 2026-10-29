@@ -1,0 +1,187 @@
+//! The storage engine: an ordered key-value store over one directory.
+//!
+//! A write is appended to the log and inserted into the memory table. When the
+//! memory table grows past `Tuning.memoryTableBytes` it is flushed to a level 0
+//! sorted table, and tables are compacted down the levels. A read checks the memory
+//! table, then the tables from newest to oldest. Each write takes the next sequence
+//! number, and each read is taken at the sequence number current when it starts.
+//!
+//! Start a store with [`openStore`](openStore).
+import Foundation
+
+/// A sorted table in use: what the manifest says of it, the open table, and
+/// its size in bytes.
+struct LiveTable {
+    /// The table's record in the manifest.
+    let record: TableRecord
+    /// The open table.
+    let table: SortedTable
+    /// The table's size in bytes.
+    let size: UNumber
+}
+
+/// The ordered key-value store of SPEC section 5, over one directory.
+///
+/// Writes go to a write-ahead log and an in-memory table first, and are flushed to sorted tables on disk as the memory table fills. Reads check memory, then the tables from newest to oldest.
+public struct Store {
+    /// The directory the store's files are kept in.
+    let directory: String
+    /// What the store's files are, and the last sequence number written.
+    var manifest: Manifest
+    /// The write-ahead log that new batches are appended to.
+    var log: LogWriter
+    /// The writes not yet flushed to a sorted table.
+    var memory: MemoryTable
+    /// The sorted tables in use, in the order a read searches them.
+    var tables: [LiveTable]
+    /// The table blocks read recently, kept in memory so a repeated read of the same block does not read the file again.
+    let kept: KeptBlocks = KeptBlocks()
+
+    /// Writes `batch` under the next sequence number.
+    ///
+    /// The batch is in the log once this returns, so it survives a crash. An empty batch changes nothing. Once the memory table is full it is flushed and compacted.
+    ///
+    /// # Failures
+    /// The file failure of appending to the log, flushing or compacting.
+    function write(borrow mut self, batch: borrow WriteBatch) -> Result<Void, StorageFailure> {
+        if batch.writes.count == 0 { return .Ok }
+        let sequence = manifest.lastSequence + 1
+        let logged = SequencedBatch { sequence: sequence, writes: copy batch.writes }
+        try log.append(logged)
+        memory.insertBatch(logged)
+        manifest.lastSequence = sequence
+        if memory.bytes <= Tuning.memoryTableBytes { return .Ok }
+        try flush()
+        return compactWhileNeeded()
+    }
+
+    /// The value `key` holds, when it holds one.
+    ///
+    /// Newer versions are found before older ones, so a removed key answers `.None`.
+    ///
+    /// # Failures
+    /// The file or corruption failure of reading a table.
+    function get(borrow self, key: borrow [UN8]) -> Result<[UN8]?, StorageFailure> {
+        let snapshot = manifest.lastSequence
+        match memory.find(key, snapshot) {
+            Some(version) -> return .Ok(valueOf(version))
+            // The tables hold older versions.
+            None -> {}
+        }
+        for live in tables {
+            if !live.record.covers(key) { continue }
+            let found = try live.table.find(key, snapshot, kept, live.record.number)
+            match found {
+                Some(version) -> return .Ok(valueOf(version))
+                // An older table may hold the key.
+                None -> continue
+            }
+        }
+        return .Ok(.None)
+    }
+
+    /// Every key from `start` up to, not including, `end`, with its value, in key order. Removed keys are left out.
+    ///
+    /// # Failures
+    /// The file or corruption failure of reading a table.
+    function scan(
+        borrow self,
+        start: borrow [UN8],
+        end: borrow [UN8]
+    ) -> Result<[KeyValue], StorageFailure> {
+        let snapshot = manifest.lastSequence
+        var sources: [[Entry]] = [memory.entriesIn(start, end, snapshot)]
+        for live in tables {
+            if !live.record.overlaps(start, end) { continue }
+            let entries = try live.table.entriesIn(start, end)
+            sources.append(entries)
+        }
+        return .Ok(visibleValues(mergedEntries(sources), snapshot))
+    }
+
+    /// Closes the log and every open table. The store must not be used afterwards.
+    ///
+    /// # Failures
+    /// The file failure of closing the log.
+    function close(borrow self) -> Result<Void, StorageFailure> {
+        for live in tables { try live.table.close() }
+        return log.close()
+    }
+}
+
+extend TableRecord {
+    /// Returns whether `key` lies in this table's key range.
+    function covers(borrow self, key: borrow [UN8]) -> Bool {
+        return compareKeys(smallest, key) != .Greater && compareKeys(largest, key) != .Less
+    }
+
+    /// Returns whether this table is searched before `other`: a shallower level comes first, and within a level a higher file number.
+    function newerThan(borrow self, other: borrow TableRecord) -> Bool {
+        if level != other.level { return level < other.level }
+        return number > other.number
+    }
+}
+
+/// Inserting logged batches into the memory table.
+extend MemoryTable {
+    /// Inserts every write of `batch`, each stamped with the batch's sequence number.
+    function insertBatch(borrow mut self, batch: borrow SequencedBatch) {
+        for write in batch.writes {
+            match write {
+                Put(entry) -> {
+                    let (key, value) = entry
+                    insert(
+                        Entry { key: copy key, sequence: batch.sequence, version: .Put(copy value) }
+                    )
+                }
+                Delete(key) -> insert(
+                    Entry { key: copy key, sequence: batch.sequence, version: .Delete }
+                )
+            }
+        }
+    }
+}
+
+/// Returns the value a version holds, or `.None` for a removal.
+function valueOf(version: borrow Version) -> [UN8]? {
+    return match version {
+        Put(value) -> .Some(copy value)
+        Delete -> .None
+    }
+}
+
+/// The store in `directory`. A new store is created when the directory holds none, and an existing one is recovered from its manifest and log.
+///
+/// # Failures
+/// The storage failure of creating, reading or recovering its files.
+public function openStore(directory: borrow String) -> Result<Store, StorageFailure> {
+    if fileExists(filePath(directory, ManifestFile.name)) { return recoverStore(directory) }
+    if !isDirectory(directory) { try makeDirectory(directory) }
+    let manifest = freshManifest()
+    let log = try createLog(logPath(directory, manifest.log))
+    try storeManifest(directory, manifest)
+    return .Ok(
+        Store {
+            directory: copy directory,
+            manifest: manifest,
+            log: log,
+            memory: MemoryTable(),
+            tables: []
+        }
+    )
+}
+
+/// Returns the path of the log numbered `number` inside `directory`.
+function logPath(directory: borrow String, number: UNumber) -> String {
+    return filePath(directory, "\(number).log")
+}
+
+/// Returns the path of the table numbered `number` inside `directory`.
+function tablePath(directory: borrow String, number: UNumber) -> String {
+    return filePath(directory, "\(number).table")
+}
+
+/// `tables` in the order a read searches them.
+function byRecency(tables: [LiveTable]) -> [LiveTable] {
+    return tables.sorted({ left, right in left.record.newerThan(right.record) })
+}

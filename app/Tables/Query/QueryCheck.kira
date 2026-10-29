@@ -1,0 +1,82 @@
+//! Checking a query against its table before it runs.
+//!
+//! A query is refused with a [`QueryProblem`] when it names a column the table does
+//! not have, compares a column with a value of another type, orders by a column with
+//! no order, or tests a required column for null (SPEC section 7.5).
+import Foundation
+
+/// The first rule of SPEC section 7.5 the query breaks, if any.
+function queryProblem(query: borrow Query) -> QueryProblem? {
+    let schema = query.table.schema
+    for condition in query.conditions {
+        match conditionProblem(schema, condition) {
+            Some(problem) -> return .Some(problem)
+            None -> continue
+        }
+    }
+    for order in query.orders {
+        match orderableColumn(schema, order.column) {
+            Some(problem) -> return .Some(problem)
+            None -> continue
+        }
+    }
+    for name in query.columns {
+        if !schema.hasColumn(name) { return .Some(.UnknownColumn(copy name)) }
+    }
+    return .None
+}
+
+/// Returns the first problem with `condition` against `schema`, or `.None` when it has none.
+function conditionProblem(
+    schema: borrow TableSchema,
+    condition: borrow Condition
+) -> QueryProblem? {
+    return match condition {
+        Compare(comparison) -> comparisonProblem(schema, comparison)
+        IsNull(name) -> match schema.column(name) {
+            Some(column) -> column.optional ? .None : .Some(.NotOptional(copy name))
+            None -> .Some(.UnknownColumn(copy name))
+        }
+        AllOf(conditions) -> conditionsProblem(schema, conditions)
+        AnyOf(conditions) -> conditionsProblem(schema, conditions)
+    }
+}
+
+/// Returns the first problem with any of `conditions` against `schema`, or `.None` when there is none.
+function conditionsProblem(
+    schema: borrow TableSchema,
+    conditions: borrow [Condition]
+) -> QueryProblem? {
+    for condition in conditions {
+        match conditionProblem(schema, condition) {
+            Some(problem) -> return .Some(problem)
+            None -> continue
+        }
+    }
+    return .None
+}
+
+/// Returns the problem with comparing a column with a value, or `.None` when the comparison is valid.
+function comparisonProblem(
+    schema: borrow TableSchema,
+    comparison: borrow Comparison
+) -> QueryProblem? {
+    return match schema.column(comparison.column) {
+        Some(column) -> {
+            if !isOrderable(column.type) { return .Some(.UnorderedColumn(copy column.name)) }
+            if !hasType(comparison.value, column.type) {
+                return .Some(.WrongType(copy column.name))
+            }
+            .None
+        }
+        None -> .Some(.UnknownColumn(copy comparison.column))
+    }
+}
+
+/// Why rows cannot be sorted by the column, if they cannot.
+function orderableColumn(schema: borrow TableSchema, name: borrow String) -> QueryProblem? {
+    return match schema.column(name) {
+        Some(column) -> isOrderable(column.type) ? .None : .Some(.UnorderedColumn(copy name))
+        None -> .Some(.UnknownColumn(copy name))
+    }
+}

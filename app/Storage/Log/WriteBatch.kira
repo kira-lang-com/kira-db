@@ -1,0 +1,118 @@
+//! Write batches: the writes applied together, and their stored form in the log and in
+//! sorted tables.
+//!
+//! A batch is written under one sequence number, so all of its writes apply or none
+//! does. The kind byte of an operation is the same in the log and in a table
+//! (SPEC sections 5.1 and 5.3).
+import Foundation
+
+/// One change to a key: its new value, or its removal.
+public enum Write {
+    /// Sets the key to the value, given as the key bytes and the value bytes.
+    Put(([UN8], [UN8]))
+    /// Removes the key. Carries the key bytes.
+    Delete([UN8])
+}
+
+/// Writes applied together, under one sequence number (SPEC section 5.1), so all of them apply or none does.
+public struct WriteBatch {
+    /// The writes, in the order they were added.
+    var writes: [Write] = []
+
+    /// Adds a write that sets `key` to `value`.
+    function put(borrow mut self, key: [UN8], value: [UN8]) {
+        writes.append(.Put((key, value)))
+    }
+
+    /// Adds a write that removes `key`.
+    function delete(borrow mut self, key: [UN8]) {
+        writes.append(.Delete(key))
+    }
+}
+
+/// A batch as the log holds it: the sequence it was given and its writes.
+struct SequencedBatch {
+    /// The batch's sequence number.
+    let sequence: UNumber
+    /// The batch's writes, in order.
+    let writes: [Write]
+}
+
+/// The kind byte of a log operation and of a table version (SPEC sections 5.3
+/// and 5.5). Open, so a byte no kind names still reads, and is refused.
+@Open
+enum VersionKind: UN8 {
+    /// A put: the key and the value follow.
+    Put = 1
+    /// A delete: only the key follows.
+    Delete = 2
+}
+
+/// Writing batches into a byte array.
+extend Array<UN8> {
+    /// SPEC section 5.3: the sequence, the count, then each operation.
+    function appendBatch(borrow mut self, batch: borrow SequencedBatch) {
+        appendVarint(batch.sequence)
+        appendVarint(batch.writes.count)
+        for write in batch.writes {
+            match write {
+                Put(entry) -> {
+                    let (key, value) = entry
+                    self.append(code(VersionKind.Put))
+                    appendLengthPrefixed(key)
+                    appendLengthPrefixed(value)
+                }
+                Delete(key) -> {
+                    self.append(code(VersionKind.Delete))
+                    appendLengthPrefixed(key)
+                }
+            }
+        }
+    }
+}
+
+/// Reading batches from bytes.
+extend ByteCursor {
+    /// Reads one batch, which must end exactly where the cursor's bytes end.
+    ///
+    /// # Errors
+    ///
+    /// Returns `TrailingBytes` when bytes are left after the batch, and the failure of reading a write.
+    function readBatch(borrow mut self) -> Result<SequencedBatch, DecodeFailure> {
+        let sequence = try readVarint()
+        let count = try readVarint()
+        var writes: [Write] = []
+        for _ in 0..count {
+            let write = try readWrite()
+            writes.append(write)
+        }
+        if !atEnd() { return .Error(.TrailingBytes(offset)) }
+        return .Ok(SequencedBatch { sequence: sequence, writes: writes })
+    }
+
+    /// Reads one write.
+    ///
+    /// # Errors
+    ///
+    /// Returns `UnknownTag` at the kind byte's offset for a kind that is neither a put nor a delete.
+    function readWrite(borrow mut self) -> Result<Write, DecodeFailure> {
+        let start = offset
+        let kind = try readByte()
+        let key = try readLengthPrefixed()
+        return match fromCode<VersionKind>(kind) {
+            Put -> readPut(move key)
+            Delete -> .Ok(.Delete(key))
+            else -> .Error(.UnknownTag(start))
+        }
+    }
+
+    /// Reads the value of a put whose key has been read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a decode failure when the value is truncated.
+    function readPut(borrow mut self, key: [UN8]) -> Result<Write, DecodeFailure> {
+        let value = try readLengthPrefixed()
+        return .Ok(.Put((key, value)))
+    }
+}

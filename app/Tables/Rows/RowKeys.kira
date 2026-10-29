@@ -1,0 +1,132 @@
+//! Row keys: the bytes of the keys a table's rows, its indexes and its catalog are
+//! stored under.
+//!
+//! The key spaces are described in SPEC section 7.3. Every key is built from tagged
+//! parts, so keys of one space sort together, and a prefix identifies every key
+//! under it.
+import Foundation
+
+/// The key spaces of SPEC section 7.3.
+namespace TableSpace {
+    /// The space that holds the catalog and the next table id.
+    let catalog: String = "c"
+    /// The key of the next table id to hand out.
+    let nextId: String = "next-id"
+    /// The name a catalog entry for a table is stored under.
+    let table: String = "table"
+    /// The space of row keys.
+    let rows: String = "t"
+    /// The space of index entry keys.
+    let index: String = "i"
+}
+
+/// The first key after every key that starts with `prefix`: a key part
+/// starts with a tag below the largest byte.
+function pastPrefix(prefix: borrow [UN8]) -> [UN8] {
+    var end = copy prefix
+    end.append(KeyEscape.largestByte)
+    return end
+}
+
+/// Returns the key of the next table id.
+function nextIdKey() -> [UN8] {
+    var key: [UN8] = []
+    key.appendTextKey(TableSpace.catalog)
+    key.appendTextKey(TableSpace.nextId)
+    return key
+}
+
+/// Returns the catalog key of the table called `name`.
+function catalogKey(name: borrow String) -> [UN8] {
+    var key: [UN8] = []
+    key.appendTextKey(TableSpace.catalog)
+    key.appendTextKey(TableSpace.table)
+    key.appendTextKey(name)
+    return key
+}
+
+/// The bytes every row key of the table starts with.
+function rowSpace(table: borrow Table) -> [UN8] {
+    var key: [UN8] = []
+    key.appendTextKey(TableSpace.rows)
+    key.appendNumberKey(table.id)
+    return key
+}
+
+/// The bytes every entry key of the index starts with.
+function indexSpace(indexId: Number) -> [UN8] {
+    var key: [UN8] = []
+    key.appendTextKey(TableSpace.index)
+    key.appendNumberKey(indexId)
+    return key
+}
+
+/// Appending the values of key columns to a key.
+extend Array<UN8> {
+    /// Appends each value to the key as a key part.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of encoding a value.
+    function appendValues(borrow mut self, values: borrow [Value]) -> Result<Void, TableFailure> {
+        for value in values { try appendKeyPart(value) }
+        return .Ok
+    }
+}
+
+/// The key of the row whose primary key is `key`.
+function rowKey(table: borrow Table, key: borrow [Value]) -> Result<[UN8], TableFailure> {
+    if key.count != table.schema.primaryKey.count { return .Error(.Row(.KeyLength(key.count))) }
+    var stored = rowSpace(table)
+    try stored.appendValues(key)
+    return .Ok(stored)
+}
+
+/// The values of `columns` in `row`, an absent one as `Null`.
+function columnValues(row: borrow Document, columns: borrow [String]) -> [Value] {
+    var values: [Value] = []
+    for name in columns {
+        match row.field(name) {
+            Some(value) -> values.append(value)
+            None -> values.append(.Null)
+        }
+    }
+    return values
+}
+
+/// Returns the values of the primary key columns in `row`.
+function primaryKeyOf(schema: borrow TableSchema, row: borrow Document) -> [Value] {
+    return columnValues(row, schema.primaryKey)
+}
+
+/// The bytes the index's entries for `row`'s indexed values start with.
+function indexedPrefix(
+    table: borrow Table,
+    position: UNumber,
+    row: borrow Document
+) -> Result<[UN8], TableFailure> {
+    var key = indexSpace(table.indexIds[position])
+    try key.appendValues(columnValues(row, table.schema.indexes[position].columns))
+    return .Ok(key)
+}
+
+/// The key of `row`'s entry in the index at `position`.
+function indexKey(
+    table: borrow Table,
+    position: UNumber,
+    row: borrow Document
+) -> Result<[UN8], TableFailure> {
+    var key = try indexedPrefix(table, position, row)
+    try key.appendValues(primaryKeyOf(table.schema, row))
+    return .Ok(key)
+}
+
+/// The keys of every index entry of `row`, in index order.
+function indexKeys(table: borrow Table, row: borrow Document) -> Result< [[UN8]], TableFailure> {
+    var keys: [[UN8]] = []
+    for position in 0..table.indexIds.count {
+        let key = try indexKey(table, position, row)
+        keys.append(key)
+    }
+    return .Ok(keys)
+}

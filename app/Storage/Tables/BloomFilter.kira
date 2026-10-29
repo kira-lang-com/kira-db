@@ -1,0 +1,115 @@
+//! Bloom filters over a table's keys.
+//!
+//! A filter answers whether a key may be in a table. A key the filter does not hold
+//! is never in the table, and a key it holds usually is. Each key sets a fixed number
+//! of bits, chosen by double hashing from two 32-bit FNV-1a hashes. The format is
+//! SPEC section 5.5's filter block.
+import Foundation
+
+/// SPEC section 5.5's filter block constants.
+namespace Fnv {
+    /// 32-bit FNV-1a.
+    let offsetBasis: UN32 = 2166136261
+    /// The prime the hash multiplies by.
+    let prime: UN32 = 16777619
+}
+
+/// The layout of the bits of a filter.
+namespace Filter {
+    /// The smallest number of bits a filter holds, however few keys it covers.
+    let smallestBits: UNumber = 64
+    /// The number of bits in a byte.
+    let byteBits: UNumber = 8
+    /// The bit each position within a byte stands for, low bit first.
+    let masks: [UN8] = [1, 2, 4, 8, 16, 32, 64, 128]
+}
+
+/// A Bloom filter over a table's keys: a key it does not hold is never in the
+/// table, and one it holds usually is.
+struct BloomFilter {
+    /// The bits, eight to a byte, low bit first.
+    var bits: [UN8]
+    /// The number of bits the filter holds.
+    let bitCount: UNumber
+    /// The number of bits each key sets.
+    let probes: UNumber
+
+    /// Returns whether `key` may be in the table: false when any of its probe bits is clear.
+    function mayHold(borrow self, key: borrow [UN8]) -> Bool {
+        let first = fnvHash(key, Fnv.offsetBasis)
+        let second = fnvHash(key, first)
+        for probe in 0..probes {
+            if !bitSet((Number(first) + probe * Number(second)) % bitCount) { return false }
+        }
+        return true
+    }
+
+    /// Returns whether the bit at `position` is set.
+    function bitSet(borrow self, position: UNumber) -> Bool {
+        let byte = bits[floor(position / Filter.byteBits)]
+        return (byte & Filter.masks[position % Filter.byteBits]) != 0
+    }
+
+    /// Sets the bit at `position`.
+    function set(borrow mut self, position: UNumber) {
+        let index = floor(position / Filter.byteBits)
+        bits[index] = bits[index] | Filter.masks[position % Filter.byteBits]
+    }
+}
+
+/// The filter for `keys`, sized by `Tuning.filterBitsPerKey`.
+function buildFilter(keys: borrow [[UN8]]) -> BloomFilter {
+    let bitCount = max(keys.count * Tuning.filterBitsPerKey, Filter.smallestBits)
+    var bits: [UN8] = []
+    for _ in 0..ceil(bitCount / Filter.byteBits) { bits.append(0) }
+    var filter = BloomFilter { bits: bits, bitCount: bitCount, probes: Tuning.filterProbes }
+    for key in keys {
+        for position in probePositions(key, bitCount, Tuning.filterProbes) { filter.set(position) }
+    }
+    return filter
+}
+
+/// Probe `i` sets bit `(h1 + i * h2) mod bitCount` (SPEC section 5.5).
+function probePositions(key: borrow [UN8], bitCount: UNumber, probes: UNumber) -> [UNumber] {
+    let first = fnvHash(key, Fnv.offsetBasis)
+    let second = fnvHash(key, first)
+    var positions: [UNumber] = []
+    for probe in 0..probes {
+        positions.append((Number(first) + probe * Number(second)) % bitCount)
+    }
+    return positions
+}
+
+/// 32-bit FNV-1a of `bytes`, starting from `start`.
+function fnvHash(bytes: borrow [UN8], start: UN32) -> UN32 {
+    var hash = start
+    for byte in bytes { hash = wrappingMul(hash ^ UN32(byte), Fnv.prime) }
+    return hash
+}
+
+/// Writing a filter into a byte array.
+extend Array<UN8> {
+    /// SPEC section 5.5: bit count, probe count, then the bits.
+    function appendFilter(borrow mut self, filter: borrow BloomFilter) {
+        appendVarint(filter.bitCount)
+        appendVarint(filter.probes)
+        appendAll(filter.bits)
+    }
+}
+
+/// Reading a filter from bytes.
+extend ByteCursor {
+    /// Reads a filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Corrupt` at the filter's offset when its bit count is zero, and a decode failure when the bits are truncated.
+    function readFilter(borrow mut self) -> Result<BloomFilter, DecodeFailure> {
+        let start = offset
+        let bitCount = try readVarint()
+        let probes = try readVarint()
+        if bitCount == 0 { return .Error(.Corrupt(start)) }
+        let bits = try readBytes(ceil(bitCount / Filter.byteBits))
+        return .Ok(BloomFilter { bits: bits, bitCount: bitCount, probes: probes })
+    }
+}

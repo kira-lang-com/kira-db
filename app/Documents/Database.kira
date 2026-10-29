@@ -1,0 +1,219 @@
+//! Documents: named collections of documents, each stored under a key value, in one
+//! database over one store.
+//!
+//! A document is stored under the key `(Text "d", Text collection, key)` (SPEC
+//! section 6), so the documents of one collection sort together and a collection's
+//! keys form a range. Reads, writes and scans go through the store, or through a
+//! recorded run when one is active.
+import Foundation
+
+/// A named set of documents, each stored under a key value (SPEC section 6).
+public struct Collection {
+    /// The collection's name. Documents in different collections never share a key.
+    let name: String
+}
+
+/// A document and the key value it is stored under.
+public struct KeyedDocument {
+    /// The key value the document is stored under.
+    let key: Value
+    /// The document.
+    let document: Document
+}
+
+/// Why a database operation failed.
+public enum DatabaseFailure {
+    /// The storage engine failed.
+    Storage(StorageFailure)
+    /// The key value cannot be a key: lists and documents have no order.
+    Key(KeyFailure)
+    /// A stored key or document does not decode.
+    Corrupt(DecodeFailure)
+    /// A stored value decodes but is not a document.
+    NotADocument
+}
+
+/// Changes to documents, applied together: all of them or none.
+///
+/// Build one with `put` and `delete`, then pass it to `Database.apply`.
+public struct Changes {
+    /// The writes the changes make.
+    var batch: WriteBatch = WriteBatch()
+
+    /// Adds a change that stores `document` under `key` in `collection`, replacing any document there.
+    ///
+    /// # Failures
+    /// `.Key` when `key` is a list or a document.
+    function put(
+        borrow mut self,
+        collection: borrow Collection,
+        key: borrow Value,
+        document: borrow Document
+    ) -> Result<Void, DatabaseFailure> {
+        let stored = try documentKey(collection, key)
+        batch.put(move stored, encodeValue(.Document(copy document)))
+        return .Ok
+    }
+
+    /// Adds a change that removes the document under `key` in `collection`, if there is one.
+    ///
+    /// # Failures
+    /// `.Key` when `key` is a list or a document.
+    function delete(
+        borrow mut self,
+        collection: borrow Collection,
+        key: borrow Value
+    ) -> Result<Void, DatabaseFailure> {
+        let stored = try documentKey(collection, key)
+        batch.delete(move stored)
+        return .Ok
+    }
+}
+
+/// A database: collections of documents over one store.
+public struct Database {
+    /// The store the documents are kept in.
+    var store: Store
+    /// The run of writes being recorded instead of written, or `.None` when none is being recorded.
+    var recording: Recording?
+
+    /// Stores `document` under `key` in `collection`, replacing any document there. The write survives a crash once this returns.
+    ///
+    /// # Failures
+    /// `.Key` when `key` is a list or a document, or the storage failure of the write.
+    function put(
+        borrow mut self,
+        collection: borrow Collection,
+        key: borrow Value,
+        document: borrow Document
+    ) -> Result<Void, DatabaseFailure> {
+        var changes = Changes()
+        try changes.put(collection, key, document)
+        return apply(changes)
+    }
+
+    /// Removes the document under `key` in `collection`, if there is one.
+    ///
+    /// # Failures
+    /// `.Key` when `key` is a list or a document, or the storage failure of the write.
+    function delete(
+        borrow mut self,
+        collection: borrow Collection,
+        key: borrow Value
+    ) -> Result<Void, DatabaseFailure> {
+        var changes = Changes()
+        try changes.delete(collection, key)
+        return apply(changes)
+    }
+
+    /// Applies every change at once. They survive a crash once this returns.
+    ///
+    /// # Failures
+    /// The storage failure of the write.
+    function apply(borrow mut self, changes: borrow Changes) -> Result<Void, DatabaseFailure> {
+        try writeBatch(changes.batch)
+        return .Ok
+    }
+
+    /// The document under `key` in `collection`, when there is one.
+    ///
+    /// # Failures
+    /// `.Key` when `key` is a list or a document, `.Corrupt` when the stored bytes do not decode, `.NotADocument` when they are not a document, or the storage failure of the read.
+    function get(
+        borrow self,
+        collection: borrow Collection,
+        key: borrow Value
+    ) -> Result<Document?, DatabaseFailure> {
+        let stored = try documentKey(collection, key)
+        let found = try readKey(stored)
+        return match found {
+            Some(bytes) -> someDocument(move bytes)
+            None -> .Ok(.None)
+        }
+    }
+
+    /// Every document in `collection`, in key order.
+    ///
+    /// # Failures
+    /// The failure of reading the collection's keys or documents.
+    function documents(
+        borrow self,
+        collection: borrow Collection
+    ) -> Result<[KeyedDocument], DatabaseFailure> {
+        let start = collectionPrefix(collection)
+        var end = copy start
+        end.append(KeyEscape.largestByte)
+        return keyedDocuments(collection, start, end)
+    }
+
+    /// The documents of `collection` whose keys lie from `from` up to, not including, `to`, in key order.
+    ///
+    /// # Failures
+    /// `.Key` when a bound is a list or a document, or the failure of the read.
+    function range(
+        borrow self,
+        collection: borrow Collection,
+        from: borrow Value,
+        to: borrow Value
+    ) -> Result<[KeyedDocument], DatabaseFailure> {
+        let start = try documentKey(collection, from)
+        let end = try documentKey(collection, to)
+        return keyedDocuments(collection, start, end)
+    }
+
+    /// The documents of `collection` whose keys lie from `start` up to, not including, `end`, in key order.
+    ///
+    /// # Failures
+    /// The failure of the scan or of decoding a stored document.
+    function keyedDocuments(
+        borrow self,
+        collection: borrow Collection,
+        start: borrow [UN8],
+        end: borrow [UN8]
+    ) -> Result<[KeyedDocument], DatabaseFailure> {
+        let pairs = try scanKeys(start, end)
+        let prefixBytes = collectionPrefix(collection).count
+        var keyed: [KeyedDocument] = []
+        for pair in pairs {
+            let document = try keyedDocument(pair, prefixBytes)
+            keyed.append(document)
+        }
+        return .Ok(keyed)
+    }
+
+    /// Closes the database's store. The database must not be used afterwards.
+    ///
+    /// # Failures
+    /// The storage failure of closing the store.
+    function close(borrow self) -> Result<Void, DatabaseFailure> {
+        try store.close()
+        return .Ok
+    }
+}
+
+/// The database in `directory`, created when the directory holds none.
+///
+/// # Failures
+/// The storage failure of opening its store.
+public function openDatabase(directory: borrow String) -> Result<Database, DatabaseFailure> {
+    let store = try openStore(directory)
+    return .Ok(Database { store: store, recording: .None })
+}
+
+/// The conversions `try` makes when it passes a failure up.
+extend DatabaseFailure {
+    /// Returns the storage failure as a `Storage` database failure.
+    function from(failure: StorageFailure) -> DatabaseFailure {
+        return .Storage(failure)
+    }
+
+    /// Returns the key failure as a `Key` database failure.
+    function from(failure: KeyFailure) -> DatabaseFailure {
+        return .Key(failure)
+    }
+
+    /// Returns the decode failure as a `Corrupt` database failure.
+    function from(failure: DecodeFailure) -> DatabaseFailure {
+        return .Corrupt(failure)
+    }
+}

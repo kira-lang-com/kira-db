@@ -1,0 +1,38 @@
+//! Variable-length numbers, as the byte format writes them.
+//!
+//! A varint carries seven bits in each byte, low bits first, with the top bit set
+//! on every byte but the last. Lengths in the format are varints followed by their
+//! bytes. The format is SPEC section 3.2.
+import Foundation
+
+/// SPEC section 3.2: seven bits per byte, low bits first, the top bit set on
+/// every byte but the last.
+namespace Varint {
+    /// The top bit, set on every byte but the last.
+    let continuation: UN8 = 128
+    /// The number of values one byte's seven bits hold.
+    let payload: UNumber = 128
+    /// The seven bits each byte carries.
+    let lowBits: UN8 = 127
+    /// The most bytes a varint takes.
+    let longest: UNumber = 10
+}
+
+/// Writing varints into a byte array.
+extend Array<UN8> {
+    /// Appends `value` as a varint.
+    function appendVarint(borrow mut self, value: UNumber) {
+        var rest = value
+        while rest >= Varint.payload {
+            self.append(UN8(rest % Varint.payload) | Varint.continuation)
+            rest = floor(rest / Varint.payload)
+        }
+        self.append(UN8(rest))
+    }
+
+    /// Appends `bytes` preceded by their count as a varint.
+    function appendLengthPrefixed(borrow mut self, bytes: borrow [UN8]) {
+        appendVarint(bytes.count)
+        appendAll(bytes)
+    }
+}

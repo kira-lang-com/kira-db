@@ -1,0 +1,190 @@
+//! Tests for documents in collections: put, get, delete and list by key, ranges in key order, refused unordered keys, and documents kept across a reopen.
+import Foundation
+import KiraDB
+
+// Documents in collections: put, get, delete and list by key, ranges in key
+// order, unordered keys refused, and documents kept across a reopen.
+
+/// A document with a name and an age.
+function personDocument(name: borrow String, age: Number) -> Document {
+    var document = Document()
+    document.set(copy name, .Text(copy name))
+    document.set("age", .Number(age))
+    return document
+}
+
+/// Keys and field counts as text: `key=fields` for each, space separated.
+function documentListing(read: borrow Result<[KeyedDocument], DatabaseFailure>) -> String {
+    return match read {
+        Ok(documents) -> {
+            var text = ""
+            for keyed in documents {
+                if text.count > 0 { text = text + " " }
+                text = text + "\(traceText(keyed.key))=\(keyed.document.fields.count)"
+            }
+            text
+        }
+        Error(failure) -> traceText(failure)
+    }
+}
+
+/// The age of the document at `key`, `none` when there is none.
+function ageAt(
+    database: borrow Database,
+    collection: borrow Collection,
+    key: borrow Value
+) -> String {
+    return match database.get(collection, key) {
+        Ok(found) -> match found {
+            Some(document) -> traceText(document.field("age"))
+            None -> "none"
+        }
+        Error(failure) -> traceText(failure)
+    }
+}
+
+/// A fresh database for one test, or the failure as text.
+function databaseFor(name: borrow String) -> Result<Database, String> {
+    return match emptyDirectory(name) {
+        Ok(path) -> match openDatabase(path) {
+            Ok(database) -> .Ok(database)
+            Error(failure) -> .Error(traceText(failure))
+        }
+        Error(failure) -> .Error(traceText(failure))
+    }
+}
+
+/// Three people and a pet are written in one change; one person is deleted.
+@Test
+function putGetAndDeleteDocuments() {
+    var open = match databaseFor("documents-put-get") {
+        Ok(database) -> database
+        Error(text) -> {
+            expect!((text) == "")
+            return
+        }
+    }
+    let people = Collection { name: "people" }
+    let pets = Collection { name: "pets" }
+    var changes = Changes()
+    for (key, age) in [("ada", 36), ("alan", 41), ("grace", 85)] {
+        match changes.put(people, .Text(key), personDocument(key, age)) {
+            Ok -> {}
+            Error(failure) -> {
+                expect!((traceText(failure)) == "")
+                return
+            }
+        }
+    }
+    match changes.put(pets, .Text("rex"), personDocument("rex", 3)) {
+        Ok -> {}
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    match open.apply(changes) {
+        Ok -> {}
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    match open.delete(people, .Text("alan")) {
+        Ok -> {}
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    expect!((ageAt(open, people, .Text("ada"))) == "Some(Value.Number(36))")
+    expect!((ageAt(open, people, .Text("alan"))) == "none")
+    expect!(
+        (documentListing(open.documents(people))) == "Value.Text(\"ada\")=2 Value.Text(\"grace\")=2"
+    )
+    expect!((documentListing(open.documents(pets))) == "Value.Text(\"rex\")=2")
+}
+
+/// Numbers of every size list in numeric order, and a range keeps the ones
+/// between its bounds.
+@Test
+function rangeListsNumbersInOrder() {
+    var open = match databaseFor("documents-range") {
+        Ok(database) -> database
+        Error(text) -> {
+            expect!((text) == "")
+            return
+        }
+    }
+    let readings = Collection { name: "readings" }
+    for key in [-12.5, -1, 0, 0.001, 3, 250, 18446744073709551615] {
+        match open.put(readings, .Number(key), personDocument("r", key)) {
+            Ok -> {}
+            Error(failure) -> {
+                expect!((traceText(failure)) == "")
+                return
+            }
+        }
+    }
+    expect!(
+        (
+            documentListing(open.range(readings, .Number(-1), .Number(250)))
+        ) == "Value.Number(-1)=2 Value.Number(0)=2 Value.Number(0.001)=2 Value.Number(3)=2"
+    )
+}
+
+/// A key that is a list has no order, so the store refuses it.
+@Test
+function unorderedKeysAreRefused() {
+    var open = match databaseFor("documents-unordered") {
+        Ok(database) -> database
+        Error(text) -> {
+            expect!((text) == "")
+            return
+        }
+    }
+    let outcome = match open.put(Collection { name: "c" }, .List([]), Document()) {
+        Ok -> "stored"
+        Error(failure) -> traceText(failure)
+    }
+    expect!((outcome) == "DatabaseFailure.Key(KeyFailure.Unordered)")
+}
+
+/// A document written and the database closed reads back after a reopen.
+@Test
+function documentsSurviveAReopen() {
+    let path = match emptyDirectory("documents-reopen") {
+        Ok(found) -> found
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    var open = match openDatabase(path) {
+        Ok(database) -> database
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    let people = Collection { name: "people" }
+    match open.put(people, .Text("ada"), personDocument("ada", 36)) {
+        Ok -> {}
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    match open.close() {
+        Ok -> {}
+        Error(failure) -> {
+            expect!((traceText(failure)) == "")
+            return
+        }
+    }
+    let outcome = match openDatabase(path) {
+        Ok(reopened) -> ageAt(reopened, people, .Text("ada"))
+        Error(failure) -> traceText(failure)
+    }
+    expect!((outcome) == "Some(Value.Number(36))")
+}

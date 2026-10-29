@@ -1,0 +1,243 @@
+//! Shared harness for the sync tests: a server and its replicas on loopback, and the todo functions they call.
+import Foundation
+import KiraDB
+
+/// The collection the todo functions read and write.
+function todoCollection() -> Collection {
+    return Collection { name: "todos" }
+}
+
+/// Every todo's text, in key order.
+function listTodos(
+    database: borrow Database,
+    caller: borrow Caller,
+    arguments: borrow Value
+) -> Result<Value, FunctionFailure> {
+    let todos = try database.documents(todoCollection())
+    var texts: [Value] = []
+    for todo in todos {
+        match todo.document.field("text") {
+            Some(text) -> texts.append(text)
+            None -> return .Error(.Refused("a todo without text"))
+        }
+    }
+    return .Ok(.List(texts))
+}
+
+/// The text of the todo at the arguments' key, or `Null`.
+function oneTodo(
+    database: borrow Database,
+    caller: borrow Caller,
+    arguments: borrow Value
+) -> Result<Value, FunctionFailure> {
+    let found = try database.get(todoCollection(), arguments)
+    return match found {
+        Some(todo) -> match todo.field("text") {
+            Some(text) -> .Ok(text)
+            None -> .Error(.Refused("a todo without text"))
+        }
+        None -> .Ok(.Null)
+    }
+}
+
+/// Stores `{key, text}` as a todo; refuses an empty text.
+function addTodo(
+    database: borrow mut Database,
+    caller: borrow Caller,
+    arguments: borrow Value
+) -> Result<Value, FunctionFailure> {
+    let fields = match arguments.document() {
+        Some(fields) -> fields
+        None -> return .Error(.Refused("arguments are not a document"))
+    }
+    let key = match fields.field("key") {
+        Some(key) -> key
+        None -> return .Error(.Refused("no key"))
+    }
+    let text = match fields.textField("text") {
+        Some(text) -> text
+        None -> return .Error(.Refused("no text"))
+    }
+    var todo = Document()
+    todo.set("text", .Text(copy text))
+    try database.put(todoCollection(), key, todo)
+    if text.count == 0 { return .Error(.Refused("empty text")) }
+    return .Ok(copy key)
+}
+
+/// The functions a todo server exposes: the `todos` and `todo` queries and the `addTodo` mutation.
+function todoFunctions() -> Functions {
+    return Functions {
+        queries: [QueryFunction {
+            name: "todos",
+            run: { database, caller, arguments in return listTodos(database, caller, arguments) }
+        }, QueryFunction {
+            name: "todo",
+            run: { database, caller, arguments in return oneTodo(database, caller, arguments) }
+        }],
+        mutations: [MutationFunction {
+            name: "addTodo",
+            run: { database, caller, arguments in return addTodo(database, caller, arguments) }
+        }]
+    }
+}
+
+/// A todo document with `key` and `text`, as a value.
+function todo(key: Number, text: String) -> Value {
+    var fields = Document()
+    fields.set("key", .Number(key))
+    fields.set("text", .Text(move text))
+    return .Document(fields)
+}
+
+/// Credentials are the user's name as text, and any name is accepted.
+function anyone(credentials: borrow Value) -> Result<Value, String> {
+    return match credentials.text() {
+        Some(name) -> .Ok(.Text(name))
+        None -> .Error("who are you")
+    }
+}
+
+/// A server and replicas, each replica on a session of its own.
+struct SyncRig {
+    var server: SyncServer
+    var replicas: [Replica]
+    var sessions: [Number]
+
+    /// Connects replica `index` on a new session.
+    function connect(borrow mut self, index: UNumber, credentials: Value) {
+        sessions[index] = server.open()
+        replicas[index].connect(move credentials)
+    }
+
+    /// Ends replica `index`'s session.
+    function drop(borrow mut self, index: UNumber) {
+        server.close(sessions[index])
+        replicas[index].disconnect()
+        sessions[index] = 0
+    }
+
+    /// Carries every message, as frames, until none is left.
+    function pump(borrow mut self) -> Result<Void, String> {
+        while true {
+            var moved = false
+            for index in 0..replicas.count {
+                for message in replicas[index].take() {
+                    moved = true
+                    if sessions[index] == 0 { continue }
+                    let bodies = try framesOf(encodeClientMessage(message))
+                    for body in bodies {
+                        match server.receiveFrame(sessions[index], copy body) {
+                            Ok -> {}
+                            Error(failure) -> return .Error(traceText(failure))
+                        }
+                    }
+                }
+            }
+            for outgoing in server.take() {
+                moved = true
+                for index in 0..replicas.count {
+                    if sessions[index] != outgoing.session { continue }
+                    let bodies = try framesOf(encodeServerMessage(outgoing.message))
+                    for body in bodies {
+                        match replicas[index].receiveFrame(copy body) {
+                            Ok -> {}
+                            Error(failure) -> return .Error(traceText(failure))
+                        }
+                    }
+                }
+            }
+            if !moved { return .Ok }
+        }
+        return .Ok
+    }
+
+    /// The query's texts over replica `index`'s view, as `[a,b]`.
+    function shown(borrow mut self, index: UNumber, query: Number) -> String {
+        let values = match replicas[index].result(query) {
+            Ok(value) -> match value.list() {
+                Some(values) -> values
+                None -> return traceText(value)
+            }
+            Error(failure) -> return traceText(failure)
+        }
+        var texts = ""
+        for value in values {
+            if texts.count > 0 { texts = texts + "," }
+            texts = texts + match value.text() {
+                Some(text) -> text
+                None -> traceText(value)
+            }
+        }
+        return "[" + texts + "]"
+    }
+}
+
+/// The bodies of the frames `bytes` hold.
+///
+/// # Errors
+///
+/// Returns the frame reader's failure as text.
+function framesOf(bytes: borrow [UN8]) -> Result< [[UN8]], String> {
+    var reader = FrameReader()
+    // Fed a byte at a time, so a frame split anywhere still reads.
+    var bodies: [[UN8]] = []
+    for byte in bytes {
+        match reader.feed([byte]) {
+            Ok(read) -> for body in read { bodies.append(body) }
+            Error(failure) -> return .Error(traceText(failure))
+        }
+    }
+    return .Ok(bodies)
+}
+
+/// A rig over fresh directories: a server and `count` replicas.
+function freshRig(name: borrow String, count: UNumber) -> Result<SyncRig, String> {
+    let serverPath = try emptyDirectory(name + "-server") otherwise return .Error("no directory")
+    let server = try openSyncServer(serverPath, todoFunctions(), anyone) otherwise return .Error(
+        "no server"
+    )
+    var replicas: [Replica] = []
+    var sessions: [Number] = []
+    for index in 0..count {
+        let path = try emptyDirectory(name + "-replica-\(index)") otherwise return .Error(
+            "no directory"
+        )
+        let replica = try openReplica(path, todoFunctions()) otherwise return .Error("no replica")
+        replicas.append(replica)
+        sessions.append(0)
+    }
+    return .Ok(SyncRig { server: server, replicas: replicas, sessions: sessions })
+}
+
+/// Runs `body` on a fresh rig, answering its parts or why it failed.
+function withRig(
+    name: borrow String,
+    count: UNumber,
+    body: (SyncRig) -> Result<[String], String>
+) -> Result<[String], String> {
+    let rig = match freshRig(name, count) {
+        Ok(found) -> found
+        Error(reason) -> return .Error(reason)
+    }
+    return body(move rig)
+}
+
+/// The texts joined with `separator`, in order.
+function joinTexts(texts: borrow [String], separator: borrow String) -> String {
+    var joined = ""
+    for index in 0..texts.count {
+        if index > 0 { joined = joined + separator }
+        joined = joined + texts[index]
+    }
+    return joined
+}
+
+/// Each event a replica has pending, as text, in order.
+function eventTexts(replica: borrow mut Replica) -> String {
+    var texts: [String] = []
+    for event in replica.takeEvents() {
+        texts.append(traceText(event))
+    }
+    return joinTexts(texts, " ")
+}

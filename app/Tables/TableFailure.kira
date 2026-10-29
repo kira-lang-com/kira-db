@@ -1,0 +1,99 @@
+//! The failures a table operation reports.
+//!
+//! Each failure names the first problem an operation finds, whether it comes from
+//! the database underneath, from a schema, a row or a query, or from an index entry
+//! that names a missing row. The enums for each kind of problem are declared here
+//! too.
+import Foundation
+
+/// Why a table operation failed.
+///
+/// An operation fails with the first problem it finds: a storage or key failure from the database, a schema the table cannot have, a row or query that does not fit the table, or an index entry that names a missing row.
+public enum TableFailure {
+    /// The database failed underneath the table operation.
+    Database(DatabaseFailure)
+    /// The schema given to create or open a table is not valid.
+    Schema(SchemaProblem)
+    /// A table with this name already exists. Carries the name.
+    TableExists(String)
+    /// No table has this name. Carries the name.
+    NoSuchTable(String)
+    /// The named table's catalog entry does not read as SPEC section 7.3 says. Carries the name.
+    CorruptCatalog(String)
+    /// A row is not valid for its table.
+    Row(RowProblem)
+    /// An insert found a row with the same primary key.
+    DuplicateKey
+    /// A write would give two rows the same values in this unique index. Carries the index's name.
+    NotUnique(String)
+    /// An update found no row with the primary key.
+    NoSuchRow
+    /// A query is not valid for its table.
+    Query(QueryProblem)
+    /// An entry of the named index names a row that is not stored. Carries the index's name.
+    DanglingEntry(String)
+}
+
+/// Why a row is not valid for its table (SPEC section 7.2).
+public enum RowProblem {
+    /// The row sets a column the table does not have. Carries the column's name.
+    UnknownColumn(String)
+    /// The row leaves out a required column. Carries the column's name.
+    MissingColumn(String)
+    /// A value does not have its column's type. Carries the column's name.
+    WrongType(String)
+    /// A primary key holds a different number of values than the table's key has columns.
+    KeyLength(UNumber)
+    /// An update would change the primary key column. Carries the column's name.
+    KeyChanged(String)
+}
+
+/// Why a query is not valid for its table (SPEC section 7.5).
+public enum QueryProblem {
+    /// The query names a column the table does not have. Carries the column's name.
+    UnknownColumn(String)
+    /// The query orders by a column whose type has no order, such as a list or a document. Carries the column's name.
+    UnorderedColumn(String)
+    /// A condition compares a column with a value of another type. Carries the column's name.
+    WrongType(String)
+    /// A null test names a column that is not optional, so no row can hold null there. Carries the column's name.
+    NotOptional(String)
+}
+
+/// The conversions `try` makes when it passes a failure up.
+extend TableFailure {
+    /// Returns the database failure as a `Database` table failure.
+    function from(failure: DatabaseFailure) -> TableFailure {
+        return .Database(failure)
+    }
+
+    /// Returns the storage failure as a `Database` table failure.
+    function from(failure: StorageFailure) -> TableFailure {
+        return .Database(.Storage(failure))
+    }
+
+    /// Returns the key failure as a `Database` table failure.
+    function from(failure: KeyFailure) -> TableFailure {
+        return .Database(.Key(failure))
+    }
+
+    /// Returns the decode failure as a `Database` corruption failure.
+    function from(failure: DecodeFailure) -> TableFailure {
+        return .Database(.Corrupt(failure))
+    }
+
+    /// Returns the schema problem as a `Schema` table failure.
+    function from(failure: SchemaProblem) -> TableFailure {
+        return .Schema(failure)
+    }
+
+    /// Returns the row problem as a `Row` table failure.
+    function from(failure: RowProblem) -> TableFailure {
+        return .Row(failure)
+    }
+
+    /// Returns the query problem as a `Query` table failure.
+    function from(failure: QueryProblem) -> TableFailure {
+        return .Query(failure)
+    }
+}

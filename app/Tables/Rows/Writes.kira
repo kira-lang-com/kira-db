@@ -1,0 +1,246 @@
+//! Row writes: inserting, replacing, updating and deleting rows, with their
+//! index entries kept in step.
+//!
+//! Each write is one batch, so a row and its index entries change together or not
+//! at all. A write that would break a unique index, change a primary key column,
+//! or repeat a primary key on insert is refused before anything is written.
+import Foundation
+
+/// What a row write does when a row with the same primary key exists.
+enum Existing {
+    /// An insert: the existing row fails the write.
+    Refuse
+    /// A replace or an update: the existing row gives way.
+    Replace
+}
+
+/// Row writes (SPEC section 7.4), each one batch.
+extend Database {
+    /// Stores `row`; fails when a row with its primary key exists.
+    function insert(
+        borrow mut self,
+        table: borrow Table,
+        row: borrow Document
+    ) -> Result<Void, TableFailure> {
+        return writeRow(table, row, .Refuse)
+    }
+
+    /// Stores `row`, replacing the row with its primary key if there is one.
+    function replace(
+        borrow mut self,
+        table: borrow Table,
+        row: borrow Document
+    ) -> Result<Void, TableFailure> {
+        return writeRow(table, row, .Replace)
+    }
+
+    /// Sets the fields of `changes` on the row whose primary key is `key`.
+    function update(
+        borrow mut self,
+        table: borrow Table,
+        key: borrow [Value],
+        changes: borrow Document
+    ) -> Result<Void, TableFailure> {
+        let found = try row(table, key)
+        return match found {
+            Some(existing) -> updateRow(table, existing, changes)
+            None -> .Error(.NoSuchRow)
+        }
+    }
+
+    /// Writes `existing` with the fields of `changes` set, replacing the stored row.
+    ///
+    /// # Errors
+    ///
+    /// Returns `KeyChanged` when a primary key column differs, and the failure of the write.
+    function updateRow(
+        borrow mut self,
+        table: borrow Table,
+        existing: borrow Document,
+        changes: borrow Document
+    ) -> Result<Void, TableFailure> {
+        let updated = updatedRow(existing, changes)
+        let changed = try changedKeyColumn(table.schema, existing, updated)
+        return match changed {
+            Some(name) -> .Error(.Row(.KeyChanged(name)))
+            None -> writeRow(table, updated, .Replace)
+        }
+    }
+
+    /// Removes the row whose primary key is `key`, if there is one.
+    function delete(
+        borrow mut self,
+        table: borrow Table,
+        key: borrow [Value]
+    ) -> Result<Void, TableFailure> {
+        let stored = try rowKey(table, key)
+        let found = try storedRowAt(stored)
+        return match found {
+            Some(existing) -> deleteRow(table, move stored, existing)
+            // Deleting a row that is not there leaves the table as it is.
+            None -> .Ok
+        }
+    }
+
+    /// Removes the row stored under `key` and its index entries, in one batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the index key computation or the write.
+    function deleteRow(
+        borrow mut self,
+        table: borrow Table,
+        key: [UN8],
+        existing: borrow Document
+    ) -> Result<Void, TableFailure> {
+        var batch = WriteBatch()
+        batch.delete(move key)
+        let entries = try indexKeys(table, existing)
+        for entry in entries { batch.delete(copy entry) }
+        return rawWrite(batch)
+    }
+
+    /// The row whose primary key is `key`, if there is one.
+    function row(
+        borrow self,
+        table: borrow Table,
+        key: borrow [Value]
+    ) -> Result<Document?, TableFailure> {
+        let stored = try rowKey(table, key)
+        return storedRowAt(stored)
+    }
+
+    /// Returns the row stored under the raw `key`, or `.None` when there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the read, or of decoding a stored row.
+    function storedRowAt(borrow self, key: borrow [UN8]) -> Result<Document?, TableFailure> {
+        let found = try rawGet(key)
+        return match found {
+            Some(bytes) -> someRow(move bytes)
+            None -> .Ok(.None)
+        }
+    }
+
+    /// Stores `row` with its index entries, removing the entries of the row
+    /// it replaces that the new row does not have.
+    function writeRow(
+        borrow mut self,
+        table: borrow Table,
+        row: borrow Document,
+        existing: Existing
+    ) -> Result<Void, TableFailure> {
+        let stored = try storedRow(table.schema, row)
+        let key = try rowKey(table, primaryKeyOf(table.schema, stored))
+        let found = try storedRowAt(key)
+        var previous: [[UN8]] = []
+        match found {
+            Some(old) -> match existing {
+                Refuse -> return .Error(.DuplicateKey)
+                Replace -> previous = try indexKeys(table, old)
+            }
+            // A new row replaces no index entries.
+            None -> {}
+        }
+        try checkUnique(table, stored)
+        return storeRow(table, move key, stored, previous)
+    }
+
+    /// Writes `row` under `key` together with its index entries, and deletes the `previous` entries the new row does not keep.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure of the index key computation or the write.
+    function storeRow(
+        borrow mut self,
+        table: borrow Table,
+        key: [UN8],
+        row: borrow Document,
+        previous: borrow [[UN8]]
+    ) -> Result<Void, TableFailure> {
+        let current = try indexKeys(table, row)
+        var batch = WriteBatch()
+        // An entry the new row also has stays; deleting and putting one key in
+        // one batch would give both the same sequence.
+        for old in previous {
+            if !current.contains(old) { batch.delete(copy old) }
+        }
+        for entry in current {
+            if !previous.contains(entry) { batch.put(copy entry, []) }
+        }
+        batch.put(move key, encodeValue(.Document(copy row)))
+        return rawWrite(batch)
+    }
+
+    /// Fails when `row` would break a unique index: another row's entry holds
+    /// the same indexed values. Rows with a `Null` indexed value are not
+    /// compared.
+    function checkUnique(
+        borrow self,
+        table: borrow Table,
+        row: borrow Document
+    ) -> Result<Void, TableFailure> {
+        for (position, index) in table.schema.indexes.enumerated() {
+            if !index.unique || hasNull(columnValues(row, index.columns)) { continue }
+            let clash = try uniqueClash(table, position, row)
+            if clash { return .Error(.NotUnique(copy index.name)) }
+        }
+        return .Ok
+    }
+
+    /// Whether the index at `position` holds an entry of another row with
+    /// `row`'s indexed values.
+    function uniqueClash(
+        borrow self,
+        table: borrow Table,
+        position: UNumber,
+        row: borrow Document
+    ) -> Result<Bool, TableFailure> {
+        let prefix = try indexedPrefix(table, position, row)
+        let own = try indexKey(table, position, row)
+        let entries = try rawScan(prefix, pastPrefix(prefix))
+        return .Ok(holdsOtherKey(entries, own))
+    }
+}
+
+/// Decodes a stored row and returns it as present.
+///
+/// # Errors
+///
+/// Returns the failure of decoding the row.
+function someRow(bytes: [UN8]) -> Result<Document?, TableFailure> {
+    let document = try rowOf(move bytes)
+    return .Ok(.Some(document))
+}
+
+/// Returns whether any of `entries` has a key other than `own`.
+function holdsOtherKey(entries: borrow [KeyValue], own: borrow [UN8]) -> Bool {
+    for entry in entries {
+        if entry.key != own { return true }
+    }
+    return false
+}
+
+/// Returns whether any of `values` is `Null`.
+function hasNull(values: borrow [Value]) -> Bool {
+    for value in values {
+        if value.isNull() { return true }
+    }
+    return false
+}
+
+/// The first primary key column whose value differs between the rows, in
+/// key order, if one does.
+function changedKeyColumn(
+    schema: borrow TableSchema,
+    before: borrow Document,
+    after: borrow Document
+) -> Result<String?, TableFailure> {
+    for name in schema.primaryKey {
+        let old = try encodeKey(columnValues(before, [copy name]))
+        let new = try encodeKey(columnValues(after, [copy name]))
+        if new != old { return .Ok(.Some(copy name)) }
+    }
+    return .Ok(.None)
+}

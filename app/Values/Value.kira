@@ -1,0 +1,165 @@
+//! Values: what a document holds, and the accessors that read it.
+//!
+//! A [`Value`] is one of seven kinds, from null to a whole nested [`Document`]. A
+//! [`Document`] is an ordered list of named fields. The accessors here return an
+//! optional for a value of the wrong kind, so a caller states what it expects.
+import Foundation
+
+/// A value a document holds (SPEC section 3): null, a boolean, a number, text, bytes, a list or a document.
+public enum Value {
+    /// No value.
+    Null
+    /// A true or false value.
+    Bool(Bool)
+    /// A number.
+    Number(Number)
+    /// A text.
+    Text(String)
+    /// A byte sequence.
+    Bytes([UN8])
+    /// A list of values, in order.
+    List([Value])
+    /// A document of named fields.
+    Document(Document)
+}
+
+/// Named fields in the order they were written. A name appears at most once.
+public struct Document {
+    /// The fields, each a name and its value.
+    var fields: [(String, Value)] = []
+
+    /// The value of the field `name`, or `.None` when the document has no such field.
+    function field(borrow self, name: borrow String) -> Value? {
+        for (fieldName, value) in fields {
+            if fieldName == name { return .Some(copy value) }
+        }
+        return .None
+    }
+
+    /// Sets the field `name` to `value`, replacing its value when the field is already there. A new field is added last.
+    function set(borrow mut self, name: String, value: Value) {
+        for index in 0..fields.count {
+            let (fieldName, _) = fields[index]
+            if fieldName == name {
+                fields[index] = (move name, move value)
+                return
+            }
+        }
+        fields.append((move name, move value))
+    }
+}
+
+extend Value {
+    /// Returns whether the value is `Null`.
+    function isNull(borrow self) -> Bool {
+        return match self {
+            Null -> true
+            Bool(_) -> false
+            Number(_) -> false
+            Text(_) -> false
+            Bytes(_) -> false
+            List(_) -> false
+            Document(_) -> false
+        }
+    }
+
+    /// The number this value holds, when it is a number.
+    function number(borrow self) -> Number? {
+        return match self {
+            Number(number) -> .Some(number)
+            Null -> .None
+            Bool(_) -> .None
+            Text(_) -> .None
+            Bytes(_) -> .None
+            List(_) -> .None
+            Document(_) -> .None
+        }
+    }
+
+    /// The text this value holds, when it is text.
+    function text(borrow self) -> String? {
+        return match self {
+            Text(text) -> .Some(copy text)
+            Null -> .None
+            Bool(_) -> .None
+            Number(_) -> .None
+            Bytes(_) -> .None
+            List(_) -> .None
+            Document(_) -> .None
+        }
+    }
+
+    /// The truth this value holds, when it is a `Bool`.
+    function truth(borrow self) -> Bool? {
+        return match self {
+            Bool(truth) -> .Some(truth)
+            Null -> .None
+            Number(_) -> .None
+            Text(_) -> .None
+            Bytes(_) -> .None
+            List(_) -> .None
+            Document(_) -> .None
+        }
+    }
+
+    /// The values this value holds, when it is a list.
+    function list(borrow self) -> [Value]? {
+        return match self {
+            List(values) -> .Some(copy values)
+            Null -> .None
+            Bool(_) -> .None
+            Number(_) -> .None
+            Text(_) -> .None
+            Bytes(_) -> .None
+            Document(_) -> .None
+        }
+    }
+
+    /// The document this value holds, when it is a document.
+    function document(borrow self) -> Document? {
+        return match self {
+            Document(document) -> .Some(copy document)
+            Null -> .None
+            Bool(_) -> .None
+            Number(_) -> .None
+            Text(_) -> .None
+            Bytes(_) -> .None
+            List(_) -> .None
+        }
+    }
+}
+
+/// Reading typed fields of a document.
+extend Document {
+    /// The value of the field, when the document has it and it is a number.
+    function numberField(borrow self, name: borrow String) -> Number? {
+        return match field(name) {
+            Some(value) -> value.number()
+            None -> .None
+        }
+    }
+
+    /// Returns the text of the field `name`, or `.None` when the document has no such field or the field is not text.
+    function textField(borrow self, name: borrow String) -> String? {
+        return match field(name) {
+            Some(value) -> value.text()
+            None -> .None
+        }
+    }
+
+    /// Returns the truth of the field `name`, or `.None` when the document has no such field or the field is not a `Bool`.
+    function truthField(borrow self, name: borrow String) -> Bool? {
+        return match field(name) {
+            Some(value) -> value.truth()
+            None -> .None
+        }
+    }
+
+    /// Returns the values of the field `name`, or `.None` when the document has no such field or the field is not a list.
+    function listField(borrow self, name: borrow String) -> [Value]? {
+        return match field(name) {
+            Some(value) -> value.list()
+            None -> .None
+        }
+    }
+}
