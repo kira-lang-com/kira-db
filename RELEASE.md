@@ -1,3 +1,3 @@
 # 26.10.4
 
-Initial source release: An embedded store with key-value data, document and table layers, and client/server replica synchronization.
+The first source release of KiraDB includes an embedded key-value store, document and table layers, and a synchronization client and server for replicas.
