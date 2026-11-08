@@ -20,29 +20,52 @@ struct LiveTable {
     let size: UNumber
 }
 
+// A listener receives exactly the successfully committed storage batches.
+// It does not receive writes held by a query or optimistic mutation's
+// recording context. A separate listener is attached only when an application
+// needs change notifications; ordinary databases pay no buffering cost.
+public class StoreWriteObserver {
+    var pending: [WriteBatch] = []
+
+    function take(borrow mut self) -> [WriteBatch] {
+        let taken = move pending
+        pending = []
+        return taken
+    }
+}
+
 /// The ordered key-value store of SPEC section 5, over one directory.
 ///
 /// Writes go to a write-ahead log and an in-memory table first, and are flushed to sorted tables on disk as the memory table fills. Reads check memory, then the tables from newest to oldest.
-public struct Store {
-    /// The directory the store's files are kept in.
+public class Store {
+    // The directory the store's files are kept in.
     let directory: String
-    /// What the store's files are, and the last sequence number written.
+    // What the store's files are, and the last sequence number written.
     var manifest: Manifest
-    /// The write-ahead log that new batches are appended to.
+    // The write-ahead log that new batches are appended to.
     var log: LogWriter
-    /// The writes not yet flushed to a sorted table.
+    // The writes not yet flushed to a sorted table.
     var memory: MemoryTable
-    /// The sorted tables in use, in the order a read searches them.
+    // The sorted tables in use, in the order a read searches them.
     var tables: [LiveTable]
-    /// The table blocks read recently, kept in memory so a repeated read of the same block does not read the file again.
+    // The table blocks read recently, kept in memory so a repeated read of the same block does not read the file again.
     let kept: KeptBlocks = KeptBlocks()
+    // One observer per subscriber of the committed storage change log.
+    var observers: [StoreWriteObserver] = []
 
-    /// Writes `batch` under the next sequence number.
-    ///
-    /// The batch is in the log once this returns, so it survives a crash. An empty batch changes nothing. Once the memory table is full it is flushed and compacted.
-    ///
-    /// # Failures
-    /// The file failure of appending to the log, flushing or compacting.
+    // Opens a notification channel without opening the store a second time.
+    function observe(borrow mut self) -> StoreWriteObserver {
+        let listener = StoreWriteObserver {}
+        observers.append(copy listener)
+        return listener
+    }
+
+    // Writes `batch` under the next sequence number.
+    //
+    // The batch is in the log once this returns, so it survives a crash. An empty batch changes nothing. Once the memory table is full it is flushed and compacted.
+    //
+    // # Failures
+    // The file failure of appending to the log, flushing or compacting.
     function write(borrow mut self, batch: borrow WriteBatch) -> Result<Void, StorageFailure> {
         if batch.writes.count == 0 { return .Ok }
         let sequence = manifest.lastSequence + 1
@@ -50,17 +73,24 @@ public struct Store {
         try log.append(logged)
         memory.insertBatch(logged)
         manifest.lastSequence = sequence
+        // Notify only after a batch is in the crash-recoverable log and the
+        // in-memory index. The subsequent optional flush does not change the
+        // committed batch's identity.
+        for observer in observers {
+            var listener = copy observer
+            listener.pending.append(copy batch)
+        }
         if memory.bytes <= Tuning.memoryTableBytes { return .Ok }
         try flush()
         return compactWhileNeeded()
     }
 
-    /// The value `key` holds, when it holds one.
-    ///
-    /// Newer versions are found before older ones, so a removed key answers `.None`.
-    ///
-    /// # Failures
-    /// The file or corruption failure of reading a table.
+    // The value `key` holds, when it holds one.
+    //
+    // Newer versions are found before older ones, so a removed key answers `.None`.
+    //
+    // # Failures
+    // The file or corruption failure of reading a table.
     function get(borrow self, key: borrow [UN8]) -> Result<[UN8]?, StorageFailure> {
         let snapshot = manifest.lastSequence
         match memory.find(key, snapshot) {
@@ -80,10 +110,10 @@ public struct Store {
         return .Ok(.None)
     }
 
-    /// Every key from `start` up to, not including, `end`, with its value, in key order. Removed keys are left out.
-    ///
-    /// # Failures
-    /// The file or corruption failure of reading a table.
+    // Every key from `start` up to, not including, `end`, with its value, in key order. Removed keys are left out.
+    //
+    // # Failures
+    // The file or corruption failure of reading a table.
     function scan(
         borrow self,
         start: borrow [UN8],
@@ -99,10 +129,10 @@ public struct Store {
         return .Ok(visibleValues(mergedEntries(sources), snapshot))
     }
 
-    /// Closes the log and every open table. The store must not be used afterwards.
-    ///
-    /// # Failures
-    /// The file failure of closing the log.
+    // Closes the log and every open table. The store must not be used afterwards.
+    //
+    // # Failures
+    // The file failure of closing the log.
     function close(borrow self) -> Result<Void, StorageFailure> {
         for live in tables { try live.table.close() }
         return log.close()

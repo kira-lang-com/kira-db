@@ -28,6 +28,14 @@ extend Replica {
     /// Runs the pending mutations again over the stored replica, as one recorded run that stays open, and reports which queries changed.
     function rebuildView(borrow mut self) {
         database.endRecording()
+        // Without optimistic mutations a replica must not hold an open
+        // recorded run over its database view. Another view of the shared
+        // store (local chat writes, server generation) can then commit while
+        // this replica observes without capturing those writes as tentative.
+        if pending.count == 0 {
+            reportChanges()
+            return
+        }
         database.beginRecording()
         for mutation in pending {
             match database.mutationAnswer(functions, mutation.name, caller, mutation.arguments) {
@@ -61,9 +69,19 @@ extend Replica {
     function reportChanges(borrow mut self) {
         for index in 0..subscriptions.count {
             let subscription = subscriptions[index]
-            let shown = traceText(viewAnswer(subscription.name, subscription.arguments))
-            if shown == subscription.shown { continue }
+            let shown: [UN8] = match viewAnswer(subscription.name, subscription.arguments) {
+                Ok(value) -> encodeValue(.List([.Text("ok"), value]))
+                Error(problem) -> encodeValue(.List([.Text("error"), .Text(traceText(problem))]))
+            }
+            // A `Changed` delivered while the query is not ready is only a
+            // locally cached preview. Once the server confirms the held key
+            // ranges, report readiness even if the final value is identical.
+            // Consumers such as Chat/Work capability menus must not remain
+            // permanently in their offline fallback state after reconnect.
+            let firstReady = subscription.ready && !subscription.readyReported
+            if shown == subscription.shown && !firstReady { continue }
             subscriptions[index].shown = shown
+            if firstReady { subscriptions[index].readyReported = true }
             events.append(.Changed(subscription.query))
         }
     }
@@ -118,21 +136,25 @@ extend Replica {
                 Write(written) -> {
                     var batch = WriteBatch()
                     match written.value {
-                        Some(value) -> batch.put(copy written.key, copy value)
-                        None -> batch.delete(copy written.key)
+                        Some(value) -> batch.put(replicaStoredKey(written.key, separateCatalog), copy value)
+                        None -> batch.delete(replicaStoredKey(written.key, separateCatalog))
                     }
                     try database.writeBatch(batch)
                 }
                 Hold(given) -> {
-                    try clearRange(given.range)
+                    let range = replicaStoredRange(given.range, separateCatalog)
+                    try clearRange(range)
                     var batch = WriteBatch()
-                    for pair in given.pairs { batch.put(copy pair.key, copy pair.value) }
+                    for pair in given.pairs {
+                        batch.put(replicaStoredKey(pair.key, separateCatalog), copy pair.value)
+                    }
                     try database.writeBatch(batch)
-                    held = unionOf(held, rangesOf([copy given.range]))
+                    held = unionOf(held, rangesOf([range]))
                 }
                 Release(range) -> {
-                    try clearRange(range)
-                    held = differenceOf(held, rangesOf([copy range]))
+                    let localRange = replicaStoredRange(range, separateCatalog)
+                    try clearRange(localRange)
+                    held = differenceOf(held, rangesOf([localRange]))
                 }
             }
         }
@@ -188,7 +210,17 @@ public function openReplica(
     directory: borrow String,
     functions: Functions
 ) -> Result<Replica, SyncFailure> {
-    var database = try openDatabase(directory)
+    let database = try openDatabase(directory)
+    return replicaOnDatabase(move database, move functions)
+}
+
+/// A replica over an existing database view. Use `database.fork()` to give
+/// optimistic mutations an isolated recorded run while sharing committed
+/// local messages with the UI's ChatStore.
+public function replicaOnDatabase(
+    database: Database,
+    functions: Functions
+) -> Result<Replica, SyncFailure> {
     let client = try database.storedNumber(syncKey("client"), 0)
     let next = try database.storedNumber(syncKey("next-mutation"), 1)
     let identity = try storedValue(database, syncKey("identity"))

@@ -20,6 +20,8 @@ public enum ColumnType {
     List
     /// A document of named fields. Documents cannot be ordered, so they cannot be keys or indexed.
     Document
+    /// A reference to a durable append-only stream. Stream references cannot be indexed.
+    Stream
 }
 
 /// One column of a table: its name, its type and whether a row may leave it out.
@@ -113,6 +115,7 @@ function isOrderable(columnType: borrow ColumnType) -> Bool {
         Bytes -> true
         List -> false
         Document -> false
+        Stream -> false
     }
 }
 
@@ -185,6 +188,7 @@ function typeName(columnType: borrow ColumnType) -> String {
         Bytes -> "Bytes"
         List -> "List"
         Document -> "Document"
+        Stream -> "Stream"
     }
 }
 
@@ -197,6 +201,7 @@ function typeNamed(name: borrow String) -> ColumnType? {
         "Bytes" -> .Some(.Bytes)
         "List" -> .Some(.List)
         "Document" -> .Some(.Document)
+        "Stream" -> .Some(.Stream)
         else -> .None
     }
 }
@@ -211,5 +216,6 @@ function hasType(value: borrow Value, columnType: borrow ColumnType) -> Bool {
         Bytes(_) -> code(columnType) == code(ColumnType.Bytes)
         List(_) -> code(columnType) == code(ColumnType.List)
         Document(_) -> code(columnType) == code(ColumnType.Document)
+        Stream(_) -> code(columnType) == code(ColumnType.Stream)
     }
 }

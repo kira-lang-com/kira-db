@@ -288,3 +288,15 @@ public function openSyncServer(
     let database = try openDatabase(directory)
     return .Ok(SyncServer { database: database, functions: functions, authenticate: authenticate })
 }
+
+/// A sync server over an existing KiraDB database view. Callers should use
+/// `database.fork()` so query recording is independent from their own writes.
+/// This never opens the database directory twice; it shares the same durable
+/// storage engine and lets server-owned writes drive subscription transitions.
+public function syncServerOnDatabase(
+    database: Database,
+    functions: Functions,
+    authenticate: (borrow Value) -> Result<Value, String>
+) -> SyncServer {
+    return SyncServer { database: database, functions: functions, authenticate: authenticate }
+}

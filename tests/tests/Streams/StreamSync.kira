@@ -1,0 +1,127 @@
+//! Server-originated stream writes reach KiraDB query subscriptions in real
+//! time. The replica's local database supplies the content; no model delta is
+//! ever fed into the replica outside KiraDB's normal synchronization path.
+import Foundation
+import KiraDB
+
+function liveStreamQuery(
+    database: borrow Database,
+    caller: borrow Caller,
+    arguments: borrow Value
+) -> Result<Value, FunctionFailure> {
+    return match database.readStream("live") {
+        Ok(snapshot) -> .Ok(.Text(snapshot.content))
+        Error(problem) -> match problem {
+            Missing(_) -> .Ok(.Null)
+            else -> .Error(.Refused(traceText(problem)))
+        }
+    }
+}
+
+function streamFunctions() -> Functions {
+    return Functions {
+        queries: [QueryFunction {
+            name: "live-stream",
+            run: { database, caller, arguments in
+                return liveStreamQuery(database, caller, arguments)
+            }
+        }],
+        mutations: []
+    }
+}
+
+function streamRig(name: String) -> Result<SyncRig, String> {
+    let serverDir = try emptyDirectory(name + "-server") otherwise return .Error("server dir")
+    let clientDir = try emptyDirectory(name + "-client") otherwise return .Error("client dir")
+    let server = try openSyncServer(serverDir, streamFunctions(), anyone) otherwise return .Error("sync server")
+    let client = try openReplica(clientDir, streamFunctions()) otherwise return .Error("sync replica")
+    return .Ok(SyncRig {
+        server: server, replicas: [client], sessions: [0]
+    })
+}
+
+function streamInReplica(replica: borrow mut Replica, query: Number) -> String {
+    return match replica.result(query) {
+        Ok(value) -> match value {
+            Text(text) -> text
+            Null -> "<missing>"
+            else -> "<wrong value>"
+        }
+        Error(problem) -> traceText(problem)
+    }
+}
+
+@Test
+function serverGeneratedChunksReachTheReplicaThroughSubscriptions() {
+    var rig = match streamRig("stream-subscription") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(problem == "")
+            return
+        }
+    }
+    rig.connect(0, .Text("ada"))
+    let query = rig.replicas[0].subscribe("live-stream", .Null)
+    match rig.pump() {
+        Ok -> {}
+        Error(reason) -> { expect!(reason == "")
+            return
+        }
+    }
+    expect!(rig.replicas[0].ready(query))
+    expect!(streamInReplica(rig.replicas[0], query) == "<missing>")
+    match rig.server.streamChange(.Begin("live")) {
+        Ok(_) -> {}
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    absorb rig.pump()
+    expect!(streamInReplica(rig.replicas[0], query) == "")
+
+    match rig.server.streamChange(.Append(StreamAppend {
+        id: "live", sequence: 0, content: "Hello "
+    })) {
+        Ok(_) -> {}
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    absorb rig.pump()
+    expect!(streamInReplica(rig.replicas[0], query) == "Hello ")
+    match rig.server.streamChange(.Append(StreamAppend {
+        id: "live", sequence: 1, content: "world"
+    })) {
+        Ok(_) -> {}
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    absorb rig.pump()
+    expect!(streamInReplica(rig.replicas[0], query) == "Hello world")
+
+    // A retransmitted chunk is rejected; it cannot mutate the database or
+    // cause the subscriber's text to double.
+    let duplicate = rig.server.streamChange(.Append(StreamAppend {
+        id: "live", sequence: 1, content: "world"
+    }))
+    expect!(traceText(duplicate).contains("WrongSequence(2)"))
+    absorb rig.pump()
+    expect!(streamInReplica(rig.replicas[0], query) == "Hello world")
+
+    match rig.server.streamChange(.Complete("live")) {
+        Ok(_) -> {}
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    absorb rig.pump()
+    let locallyStored = match rig.replicas[0].database.readStream("live") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    expect!(locallyStored.content == "Hello world")
+    expect!(traceText(locallyStored.state) == "StreamState.Completed")
+    expect!(locallyStored.nextChunk == 2)
+}

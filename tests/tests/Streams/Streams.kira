@@ -1,0 +1,197 @@
+//! Durable streams are a native KiraDB value and chunk log. Clients read the
+//! same stream by stable id, at any point during generation or after restart.
+import Foundation
+import KiraDB
+
+function streamTestDatabase(name: String) -> Result<Database, String> {
+    let path = try emptyDirectory(name) otherwise return .Error("no test directory")
+    return match openDatabase(path) {
+        Ok(open) -> .Ok(open)
+        Error(failure) -> .Error(traceText(failure))
+    }
+}
+
+@Test
+function streamReferencesRoundTripAndAreNotKeys() {
+    let reference = Value.Stream("answer/42-a")
+    let encoded = encodeValue(reference)
+    let decoded = match decodeValue(move encoded) {
+        Ok(value) -> value
+        Error(failure) -> { expect!(traceText(failure) == "")
+            return
+        }
+    }
+    match decoded.stream() {
+        Some(id) -> expect!(id == "answer/42-a")
+        None -> expect!(false)
+    }
+    var row = Document()
+    row.set("content", copy reference)
+    match row.streamField("content") {
+        Some(id) -> expect!(id == "answer/42-a")
+        None -> expect!(false)
+    }
+    expect!(traceText(encodeKey([copy reference])) == "Error(KeyFailure.Unordered)")
+    let streamColumn = TableSchema {
+        name: "stream_reference_column",
+        columns: [
+            Column { name: "id", type: .Number },
+            Column { name: "content", type: .Stream }
+        ],
+        primaryKey: ["id"]
+    }
+    let open = match streamTestDatabase("stream-table") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(problem == "")
+            return
+        }
+    }
+    var db = open
+    let table = match db.createTable(streamColumn) {
+        Ok(value) -> value
+        Error(failure) -> { expect!(traceText(failure) == "")
+            return
+        }
+    }
+    row.set("id", .Number(1))
+    match db.insert(table, row) {
+        Ok -> {}
+        Error(failure) -> { expect!(traceText(failure) == "")
+            return
+        }
+    }
+    let stored = match db.row(table, [.Number(1)]) {
+        Ok(found) -> match found {
+            Some(value) -> value
+            None -> { expect!(false)
+                return
+            }
+        }
+        Error(failure) -> { expect!(traceText(failure) == "")
+            return
+        }
+    }
+    match stored.streamField("content") {
+        Some(id) -> expect!(id == "answer/42-a")
+        None -> expect!(false)
+    }
+}
+
+@Test
+function aStreamHasStableIdentityAndReadableIncrementalChunks() {
+    var db = match streamTestDatabase("stream-append") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(problem == "")
+            return
+        }
+    }
+    let reference = match db.beginStream("response-7") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    match reference.stream() {
+        Some(id) -> expect!(id == "response-7")
+        None -> expect!(false)
+    }
+    match db.appendStream("response-7", 0, "Hello ") {
+        Ok -> {}
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    let partial = match db.readStream("response-7") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    expect!(partial.content == "Hello ")
+    expect!(partial.nextChunk == 1)
+    expect!(traceText(partial.state) == "StreamState.Open")
+    absorb db.appendStream("response-7", 1, "there.")
+    let incremental = match db.readStreamSince("response-7", 1) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    expect!(incremental.content == "there.")
+    expect!(incremental.fromChunk == 1)
+    expect!(incremental.nextChunk == 2)
+    absorb db.finishStream("response-7")
+    let complete = match db.readStream("response-7") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    expect!(complete.content == "Hello there.")
+    expect!(traceText(complete.state) == "StreamState.Completed")
+}
+
+@Test
+function streamReplaysCannotDuplicateOrReorderChunks() {
+    var db = match streamTestDatabase("stream-replay") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(problem == "")
+            return
+        }
+    }
+    absorb db.beginStream("abc")
+    expect!(traceText(db.beginStream("abc")).contains("AlreadyExists"))
+    expect!(traceText(db.appendStream("abc", 1, "wrong")).contains("WrongSequence(0)"))
+    absorb db.appendStream("abc", 0, "Once")
+    expect!(traceText(db.appendStream("abc", 0, "Once")).contains("WrongSequence(1)"))
+    expect!(traceText(db.appendStream("abc", 1, "")).contains("EmptyChunk"))
+    expect!(traceText(db.readStreamSince("abc", 2)).contains("InvalidCursor"))
+    absorb db.failStream("abc", "provider disconnected")
+    let failed = match db.readStream("abc") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    expect!(failed.content == "Once")
+    expect!(traceText(failed.state).contains("provider disconnected"))
+    expect!(traceText(db.appendStream("abc", 1, "later")).contains("NotOpen"))
+    expect!(traceText(db.finishStream("abc")).contains("NotOpen"))
+}
+
+@Test
+function streamChunksSurviveClosingAndReopeningTheDatabase() {
+    let path = match emptyDirectory("stream-recovery") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    var db = match openDatabase(path) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    absorb db.beginStream("persistent")
+    absorb db.appendStream("persistent", 0, "Keep ")
+    absorb db.appendStream("persistent", 1, "me")
+    absorb db.close()
+    let reopened = match openDatabase(path) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    var other = reopened
+    let read = match other.readStream("persistent") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    expect!(read.content == "Keep me")
+    expect!(read.nextChunk == 2)
+    absorb other.finishStream("persistent")
+    absorb other.close()
+}

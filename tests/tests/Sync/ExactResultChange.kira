@@ -1,0 +1,192 @@
+//! Query equality compares encoded values, never abbreviated diagnostics.
+//! A seven-field command must notify on every state/cursor update, even if
+//! its field count (and traceText representation) stays exactly the same.
+import Foundation
+import KiraDB
+
+function statusCollection() -> Collection { return Collection { name: "status-documents" } }
+
+function statusDocumentQuery(
+    database: borrow Database,
+    caller: borrow Caller,
+    arguments: borrow Value
+) -> Result<Value, FunctionFailure> {
+    let found = try database.get(statusCollection(), .Text("job"))
+    return match found {
+        Some(document) -> .Ok(.Document(document))
+        None -> .Ok(.Null)
+    }
+}
+
+function statusDocumentMutation(
+    database: borrow mut Database,
+    caller: borrow Caller,
+    arguments: borrow Value
+) -> Result<Value, FunctionFailure> {
+    let state = match arguments.text() {
+        Some(value) -> value
+        None -> return .Error(.Refused("state must be text"))
+    }
+    var document = Document()
+    document.set("state", .Text(state))
+    document.set("chat", .Number(17))
+    document.set("cursor", .Number(1))
+    try database.put(statusCollection(), .Text("job"), document)
+    return .Ok(.Null)
+}
+
+function statusFunctions() -> Functions {
+    return Functions {
+        queries: [QueryFunction {
+            name: "status",
+            run: { database, caller, arguments in
+                return statusDocumentQuery(database, caller, arguments)
+            }
+        }],
+        mutations: [MutationFunction {
+            name: "set-status",
+            run: { database, caller, arguments in
+                return statusDocumentMutation(database, caller, arguments)
+            }
+        }]
+    }
+}
+
+@Test
+function subscriptionsDetectUpdatesWithinSameShapeDocument() {
+    let serverDir = match emptyDirectory("status-document-server") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    let viewerDir = match emptyDirectory("status-document-viewer") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    let editorDir = match emptyDirectory("status-document-editor") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    let server = match openSyncServer(serverDir, statusFunctions(), anyone) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    let viewer = match openReplica(viewerDir, statusFunctions()) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    let editor = match openReplica(editorDir, statusFunctions()) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    var rig = SyncRig { server: server, replicas: [viewer, editor], sessions: [0, 0] }
+    rig.connect(0, .Text("view"))
+    rig.connect(1, .Text("edit"))
+    let query = rig.replicas[0].subscribe("status", .Null)
+    absorb rig.pump()
+    absorb rig.replicas[0].takeEvents()
+
+    absorb rig.replicas[1].mutate("set-status", .Text("queued"))
+    absorb rig.pump()
+    let first = eventTexts(rig.replicas[0])
+    expect!(first.contains("SyncEvent.Changed("))
+    expect!(rig.replicas[0].ready(query))
+
+    // Regression: traceText documented both states as a Document with 3
+    // fields. Encoding the complete query value correctly detects the delta.
+    absorb rig.replicas[1].mutate("set-status", .Text("running"))
+    absorb rig.pump()
+    let second = eventTexts(rig.replicas[0])
+    expect!(second.contains("SyncEvent.Changed("))
+    let document = match rig.replicas[0].result(query) {
+        Ok(value) -> match value {
+            Document(found) -> found
+            else -> { expect!(false)
+                return
+            }
+        }
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    match document.textField("state") {
+        Some(value) -> expect!(value == "running")
+        None -> expect!(false)
+    }
+
+    absorb rig.replicas[1].mutate("set-status", .Text("completed"))
+    absorb rig.pump()
+    expect!(eventTexts(rig.replicas[0]).contains("SyncEvent.Changed("))
+}
+
+@Test
+function cachedSubscriptionNotifiesWhenServerConfirmsUnchangedValue() {
+    let serverDir = match emptyDirectory("ready-unchanged-server") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    let clientDir = match emptyDirectory("ready-unchanged-client") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    var stored = Document()
+    stored.set("state", .Text("completed"))
+    stored.set("chat", .Number(17))
+    stored.set("cursor", .Number(1))
+    var serverDb = match openDatabase(serverDir) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    var clientDb = match openDatabase(clientDir) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    absorb serverDb.put(statusCollection(), .Text("job"), copy stored)
+    absorb clientDb.put(statusCollection(), .Text("job"), copy stored)
+    let server = syncServerOnDatabase(move serverDb, statusFunctions(), anyone)
+    let client = match replicaOnDatabase(move clientDb, statusFunctions()) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    var rig = SyncRig { server: server, replicas: [client], sessions: [0] }
+    rig.connect(0, .Text("cached-device"))
+    let query = rig.replicas[0].subscribe("status", .Null)
+    expect!(!rig.replicas[0].ready(query))
+    // The cached document is already identical to the server's answer, so
+    // the normal equality-based notification happens *before* readiness.
+    expect!(eventTexts(rig.replicas[0]).contains("SyncEvent.Changed("))
+    absorb rig.pump()
+    expect!(rig.replicas[0].ready(query))
+    // Without the ready edge, no event was emitted here and Harmony's mode
+    // selector stayed on Chat forever after opening an existing DB.
+    expect!(eventTexts(rig.replicas[0]).contains("SyncEvent.Changed("))
+
+    // Reconnecting the same synced replica confirms the unchanged answer
+    // again. This must not leave account capabilities in their fallback UI.
+    rig.drop(0)
+    rig.connect(0, .Text("cached-device"))
+    absorb rig.pump()
+    expect!(rig.replicas[0].ready(query))
+    expect!(eventTexts(rig.replicas[0]).contains("SyncEvent.Changed("))
+}

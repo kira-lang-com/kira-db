@@ -27,6 +27,34 @@ public struct SyncHost {
     let listener: QuicListenerId
     /// The accepted connections, each carrying at most one session stream.
     var connections: [HostConnection] = []
+    /// Optional listener for *external* writers sharing this KiraDB store.
+    /// Only enabled by explicitly calling `observeCommittedWrites`.
+    var externalWrites: StoreWriteObserver? = .None
+
+    /// Attaches to server-originated writes from another database view of
+    /// this same open store; no polling of a shadow database is necessary.
+    function observeCommittedWrites(borrow mut self) {
+        externalWrites = .Some(server.database.observeWrites())
+    }
+
+    /// Broadcasts newly committed writes to query subscribers. Call this
+    /// after turning the application's producer (HTTP requests, AI chunks)
+    /// and after network events. All transitions read the original database.
+    function publishCommittedWrites(
+        borrow mut self,
+        node: borrow mut QuicNode
+    ) -> Result<Void, SyncFailure> {
+        let listener = match externalWrites {
+            Some(held) -> held
+            None -> return .Ok
+        }
+        var observed = listener
+        for batch in observed.take() {
+            try server.announceServerWrites(batch.writes)
+        }
+        flush(node)
+        return .Ok
+    }
 
     /// Takes `event` when it is the host's own, and writes what the server gave. Answers whether it was the host's.
     function event(

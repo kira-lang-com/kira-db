@@ -1,0 +1,77 @@
+import Foundation
+import KiraDB
+
+// Server-side generation and the KiraDB sync engine must see the same live
+// storage engine, but hold separate recorded-query contexts. Both operations
+// must be visible immediately without opening the directory a second time.
+@Test
+function forkedDatabaseViewsShareCommittedDataNotRecordingContexts() {
+    let path = match emptyDirectory("shared-store-views") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    var writer = match openDatabase(path) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    var queryView = writer.fork()
+    var watcher = writer.observeWrites()
+    let collection = Collection { name: "shared-test" }
+    var first = Document()
+    first.set("text", .Text("durable"))
+    match writer.put(collection, .Text("a"), first) {
+        Ok -> {}
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    let seen = match queryView.get(collection, .Text("a")) {
+        Ok(found) -> match found {
+            Some(value) -> value
+            None -> { expect!(false)
+                return
+            }
+        }
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    match seen.textField("text") {
+        Some(text) -> expect!(text == "durable")
+        None -> expect!(false)
+    }
+    let batches = watcher.take()
+    expect!(batches.count == 1)
+    expect!(batches[0].writes.count == 1)
+    expect!(watcher.take().count == 0)
+
+    queryView.beginRecording()
+    var tentative = Document()
+    tentative.set("text", .Text("optimistic"))
+    absorb queryView.put(collection, .Text("b"), tentative)
+    // Recording is local to this view, and never appears in a committed
+    // observer batch or another view's database.
+    let notCommitted = match writer.get(collection, .Text("b")) {
+        Ok(found) -> found
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    expect!(notCommitted.isNone())
+    expect!(watcher.take().count == 0)
+    absorb writer.put(collection, .Text("c"), first)
+    let otherCommit = match queryView.get(collection, .Text("c")) {
+        Ok(found) -> found
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    expect!(otherCommit.isSome())
+    expect!(watcher.take().count == 1)
+    queryView.endRecording()
+    absorb writer.close()
+}

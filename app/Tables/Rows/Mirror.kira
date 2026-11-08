@@ -1,0 +1,129 @@
+//! Materialize a subscribed table query in a local KiraDB table, addressing
+//! the table by *name*, never by a remote database's numeric catalog ID.
+//!
+//! Table IDs are allocation-local: recreating a table during a schema upgrade
+//! changes its ID. Copying raw replicated row keys is therefore insufficient
+//! when an established server has a different catalog history from a device.
+//! A mirrored partition writes the server-owned rows using the **local** table
+//! catalog while leaving unrelated rows (including offline-only rows) intact.
+import Foundation
+
+/// One equality constraint defining the rows owned by a synchronized query.
+/// Multiple constraints restrict the partition, for example cloud-origin
+/// turns belonging to one chat without touching other chats' turns.
+public struct TableMirrorScope {
+    let column: String
+    let value: Value
+}
+
+/// The local database cannot safely apply the subscribed rows.
+public enum TableMirrorFailure {
+    Table(TableFailure)
+    Query(FunctionFailure)
+    NotAList
+    NotADocument
+    Unscoped
+    UnknownScope(String)
+    OutsideScope(String)
+    DuplicateKey
+}
+
+extend TableMirrorFailure {
+    function from(problem: TableFailure) -> TableMirrorFailure { return .Table(problem) }
+    function from(problem: FunctionFailure) -> TableMirrorFailure { return .Query(problem) }
+    function from(problem: StorageFailure) -> TableMirrorFailure {
+        return .Table(.Database(.Storage(problem)))
+    }
+}
+
+extend Database {
+    /// Reconcile the complete server-owned partition of `tableName` to `rows`.
+    /// The local table's schema and catalog ID are authoritative for storage;
+    /// unknown server-only computed fields are not inserted into local rows.
+    ///
+    /// Validation and comparison run before an atomic recorded write batch.
+    /// On any error, no existing row, local-only partition, or index changes.
+    function mirrorTableRows(
+        borrow mut self,
+        tableName: borrow String,
+        scope: borrow [TableMirrorScope],
+        rows: borrow [Document]
+    ) -> Result<Void, TableMirrorFailure> {
+        if scope.count == 0 { return .Error(.Unscoped) }
+        let table = try self.table(tableName)
+        var partition = table.query()
+        for condition in scope {
+            if !table.schema.hasColumn(condition.column) {
+                return .Error(.UnknownScope(copy condition.column))
+            }
+            partition = partition.filter(column(condition.column).equals(copy condition.value))
+        }
+        let existing = try select(partition)
+        var incoming: [Document] = []
+        var incomingKeys: [[UN8]] = []
+        for source in rows {
+            // A computed field in a subscribed query is not a table column.
+            // Preserve only fields declared by the local table's schema.
+            var local = Document()
+            for declared in table.schema.columns {
+                match source.field(declared.name) {
+                    Some(value) -> local.set(copy declared.name, copy value)
+                    None -> {}
+                }
+            }
+            for condition in scope {
+                let found = match local.field(condition.column) {
+                    Some(value) -> value
+                    None -> return .Error(.OutsideScope(copy condition.column))
+                }
+                if encodeValue(found) != encodeValue(condition.value) {
+                    return .Error(.OutsideScope(copy condition.column))
+                }
+            }
+            let normalized = match storedRow(table.schema, local) {
+                Ok(valid) -> valid
+                Error(problem) -> return .Error(.Table(.Row(problem)))
+            }
+            let key = try rowKey(table, primaryKeyOf(table.schema, normalized))
+            if incomingKeys.contains(key) { return .Error(.DuplicateKey) }
+            incomingKeys.append(key)
+            incoming.append(normalized)
+        }
+
+        // A recorded run accumulates row and index changes in one batch.
+        // The caller uses an independently forked database view; no user's
+        // optimistic or query recording state is touched by the mirror.
+        beginRecording()
+        let changes = mirrorTableDiff(table, existing, incoming, incomingKeys)
+        let recorded = endRecording()
+        match changes {
+            Ok -> {
+                try writeBatch(recorded.batch)
+                return .Ok
+            }
+            Error(problem) -> return .Error(problem)
+        }
+    }
+
+    function mirrorTableDiff(
+        borrow mut self,
+        table: borrow Table,
+        existing: borrow [Document],
+        incoming: borrow [Document],
+        incomingKeys: borrow [[UN8]]
+    ) -> Result<Void, TableMirrorFailure> {
+        for row in existing {
+            let key = try rowKey(table, primaryKeyOf(table.schema, row))
+            if !incomingKeys.contains(key) { try delete(table, primaryKeyOf(table.schema, row)) }
+        }
+        for index in 0..incoming.count {
+            let old = try storedRowAt(incomingKeys[index])
+            let unchanged = match old {
+                Some(previous) -> encodeValue(.Document(previous)) == encodeValue(.Document(incoming[index]))
+                None -> false
+            }
+            if !unchanged { try replace(table, incoming[index]) }
+        }
+        return .Ok
+    }
+}

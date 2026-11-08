@@ -17,6 +17,26 @@ extend SyncServer {
         position: UNumber,
         result: MutationResult
     ) -> Result<Void, SyncFailure> {
+        rerunTouchedSubscriptions(writes)
+        for index in 0..sessions.count {
+            let results = index == position ? [copy result] : []
+            try sendTransition(index, writes, move results)
+        }
+        return .Ok
+    }
+
+    /// A server-owned background operation also changes subscribed data.
+    /// Unlike a client mutation, it has no initiating client or mutation
+    /// result. Every matching subscription still receives a transition.
+    function announceServerWrites(borrow mut self, writes: borrow [Write]) -> Result<Void, SyncFailure> {
+        rerunTouchedSubscriptions(writes)
+        for index in 0..sessions.count { try sendTransition(index, writes, []) }
+        return .Ok
+    }
+
+    /// Re-evaluates subscriptions whose recorded reads the batch touched,
+    /// including streams whose next chunk index changed while the query ran.
+    function rerunTouchedSubscriptions(borrow mut self, writes: borrow [Write]) {
         for index in 0..sessions.count {
             let caller = match sessions[index].caller {
                 Some(caller) -> caller
@@ -34,11 +54,6 @@ extend SyncServer {
                 sessions[index].subscriptions[query].reads = run.reads
             }
         }
-        for index in 0..sessions.count {
-            let results = index == position ? [copy result] : []
-            try sendTransition(index, writes, move results)
-        }
-        return .Ok
     }
 
     /// Sends the session at `position` its transition to the current

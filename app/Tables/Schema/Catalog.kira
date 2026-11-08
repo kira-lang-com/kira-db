@@ -18,22 +18,22 @@ extend Database {
             // The schema is valid.
             None -> {}
         }
-        let existing = try rawGet(catalogKey(schema.name))
+        let existing = try rawGet(catalogKeyIn(catalogNamespace, schema.name))
         if existing.isSome() { return .Error(.TableExists(copy schema.name)) }
         let next = try nextId()
         var indexIds: [Number] = []
         for position in 0..schema.indexes.count { indexIds.append(next + 1 + position) }
         let table = Table { schema: copy schema, id: next, indexIds: indexIds }
         var batch = WriteBatch()
-        batch.put(catalogKey(schema.name), encodeValue(.Document(catalogDocument(table))))
-        batch.put(nextIdKey(), encodeValue(.Number(next + 1 + schema.indexes.count)))
+        batch.put(catalogKeyIn(catalogNamespace, schema.name), encodeValue(.Document(catalogDocument(table))))
+        batch.put(nextIdKeyIn(catalogNamespace), encodeValue(.Number(next + 1 + schema.indexes.count)))
         try rawWrite(batch)
         return .Ok(table)
     }
 
     /// The table called `name`.
     function table(borrow self, name: borrow String) -> Result<Table, TableFailure> {
-        let stored = try rawGet(catalogKey(name))
+        let stored = try rawGet(catalogKeyIn(catalogNamespace, name))
         return match stored {
             Some(bytes) -> catalogTable(name, move bytes)
             None -> .Error(.NoSuchTable(copy name))
@@ -49,13 +49,13 @@ extend Database {
             let pairs = try rawScan(space, pastPrefix(space))
             for pair in pairs { batch.delete(copy pair.key) }
         }
-        batch.delete(catalogKey(table.schema.name))
+        batch.delete(catalogKeyIn(catalogNamespace, table.schema.name))
         return rawWrite(batch)
     }
 
     /// The next id the catalog gives: 1 in a database that never gave one.
     function nextId(borrow self) -> Result<Number, TableFailure> {
-        let stored = try rawGet(nextIdKey())
+        let stored = try rawGet(nextIdKeyIn(catalogNamespace))
         return match stored {
             Some(bytes) -> storedId(move bytes)
             None -> .Ok(1)

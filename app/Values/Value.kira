@@ -1,11 +1,11 @@
 //! Values: what a document holds, and the accessors that read it.
 //!
-//! A [`Value`] is one of seven kinds, from null to a whole nested [`Document`]. A
+//! A [`Value`] is one of eight kinds, from null to a whole nested [`Document`]. A
 //! [`Document`] is an ordered list of named fields. The accessors here return an
 //! optional for a value of the wrong kind, so a caller states what it expects.
 import Foundation
 
-/// A value a document holds (SPEC section 3): null, a boolean, a number, text, bytes, a list or a document.
+/// A value a document holds (SPEC section 3): scalars, collections, or a durable stream reference.
 public enum Value {
     /// No value.
     Null
@@ -21,6 +21,8 @@ public enum Value {
     List([Value])
     /// A document of named fields.
     Document(Document)
+    /// A stable id referring to content streamed into this database.
+    Stream(String)
 }
 
 /// Named fields in the order they were written. A name appears at most once.
@@ -60,6 +62,7 @@ extend Value {
             Bytes(_) -> false
             List(_) -> false
             Document(_) -> false
+            Stream(_) -> false
         }
     }
 
@@ -73,6 +76,7 @@ extend Value {
             Bytes(_) -> .None
             List(_) -> .None
             Document(_) -> .None
+            Stream(_) -> .None
         }
     }
 
@@ -86,6 +90,7 @@ extend Value {
             Bytes(_) -> .None
             List(_) -> .None
             Document(_) -> .None
+            Stream(_) -> .None
         }
     }
 
@@ -99,6 +104,7 @@ extend Value {
             Bytes(_) -> .None
             List(_) -> .None
             Document(_) -> .None
+            Stream(_) -> .None
         }
     }
 
@@ -112,6 +118,7 @@ extend Value {
             Text(_) -> .None
             Bytes(_) -> .None
             Document(_) -> .None
+            Stream(_) -> .None
         }
     }
 
@@ -125,6 +132,21 @@ extend Value {
             Text(_) -> .None
             Bytes(_) -> .None
             List(_) -> .None
+            Stream(_) -> .None
+        }
+    }
+
+    /// The stable identifier of this stream reference, if any.
+    function stream(borrow self) -> String? {
+        return match self {
+            Stream(id) -> .Some(copy id)
+            Null -> .None
+            Bool(_) -> .None
+            Number(_) -> .None
+            Text(_) -> .None
+            Bytes(_) -> .None
+            List(_) -> .None
+            Document(_) -> .None
         }
     }
 }
@@ -159,6 +181,14 @@ extend Document {
     function listField(borrow self, name: borrow String) -> [Value]? {
         return match field(name) {
             Some(value) -> value.list()
+            None -> .None
+        }
+    }
+
+    /// The stream identifier contained in this field, when it is a stream reference.
+    function streamField(borrow self, name: borrow String) -> String? {
+        return match field(name) {
+            Some(value) -> value.stream()
             None -> .None
         }
     }

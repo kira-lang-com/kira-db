@@ -1,0 +1,238 @@
+//! Durable text streams in KiraDB. A `Value.Stream(id)` is a small reference;
+//! content is a sequence of immutable chunks under that id, while a separate
+//! metadata document marks it open, complete or failed.
+//!
+//! A chunk and the metadata cursor advance in ONE write batch. A process crash
+//! cannot expose an unfinished cursor or an orphaned acknowledged chunk. Each
+//! chunk has an explicit sequence number, so reconnecting clients can request
+//! only chunks they have not seen and never reconstruct text from network deltas.
+import Foundation
+
+namespace StreamSpace {
+    let metadata: String = "__kira_streams"
+    let chunks: String = "__kira_stream_chunks"
+}
+
+/// The server's durable state for a stream.
+public enum StreamState {
+    Open
+    Completed
+    Failed(String)
+}
+
+/// The materialized content of a stream at the instant it was read.
+public struct StreamSnapshot {
+    let id: String
+    let content: String
+    let nextChunk: Number
+    let state: StreamState
+}
+
+/// Only new text since `fromChunk`. The stable reference remains unchanged.
+public struct StreamSlice {
+    let id: String
+    let fromChunk: Number
+    let nextChunk: Number
+    let content: String
+    /// Each persisted chunk in sequence. Used by replicas to reproduce the
+    /// exact server cursor, rather than guessing boundaries from text deltas.
+    let parts: [String]
+    let state: StreamState
+}
+
+/// A stream operation was refused without modifying any stored content.
+public enum StreamFailure {
+    Database(DatabaseFailure)
+    InvalidId
+    AlreadyExists(String)
+    Missing(String)
+    NotOpen(String)
+    EmptyChunk
+    WrongSequence(Number)
+    InvalidCursor(Number)
+    Corrupt(String)
+}
+
+extend StreamFailure {
+    function from(failure: DatabaseFailure) -> StreamFailure { return .Database(failure) }
+    function from(failure: KeyFailure) -> StreamFailure {
+        return .Database(.Key(failure))
+    }
+}
+
+function streamMetadata() -> Collection { return Collection { name: StreamSpace.metadata } }
+function streamChunks() -> Collection { return Collection { name: StreamSpace.chunks } }
+
+// A binary tuple avoids collisions between ids containing delimiters and
+// between sequence numbers of different lengths. Chunk order is deterministic.
+function streamChunkKey(id: borrow String, sequence: Number) -> Result<Value, StreamFailure> {
+    let bytes = try encodeKey([.Text(copy id), .Number(sequence)])
+    return .Ok(.Bytes(bytes))
+}
+
+function streamHead(next: Number, state: borrow StreamState) -> Document {
+    var head = Document()
+    head.set("next", .Number(next))
+    match state {
+        Open -> head.set("state", .Text("open"))
+        Completed -> head.set("state", .Text("completed"))
+        Failed(reason) -> {
+            head.set("state", .Text("failed"))
+            head.set("failure", .Text(copy reason))
+        }
+    }
+    return head
+}
+
+function streamHeadState(head: borrow Document) -> Result<StreamState, StreamFailure> {
+    let state = match head.textField("state") {
+        Some(state) -> state
+        None -> return .Error(.Corrupt("stream state"))
+    }
+    return match state {
+        "open" -> .Ok(.Open)
+        "completed" -> .Ok(.Completed)
+        "failed" -> match head.textField("failure") {
+            Some(reason) -> .Ok(.Failed(reason))
+            None -> .Error(.Corrupt("stream failure"))
+        }
+        else -> .Error(.Corrupt("unknown stream state"))
+    }
+}
+
+function streamNext(head: borrow Document) -> Result<Number, StreamFailure> {
+    let next = match head.numberField("next") {
+        Some(next) -> next
+        None -> return .Error(.Corrupt("stream cursor"))
+    }
+    if next < 0 || next % 1 != 0 { return .Error(.Corrupt("invalid stream cursor")) }
+    return .Ok(next)
+}
+
+extend Database {
+    /// Creates an empty open stream with the chosen globally unique id.
+    /// The caller stores the returned `Value.Stream` in its document/table row.
+    function beginStream(borrow mut self, id: borrow String) -> Result<Value, StreamFailure> {
+        if id.trim().count == 0 { return .Error(.InvalidId) }
+        let key = Value.Text(copy id)
+        let existing = try get(streamMetadata(), key)
+        if existing.isSome() {
+            return .Error(.AlreadyExists(copy id))
+        }
+        try put(streamMetadata(), key, streamHead(0, .Open))
+        return .Ok(.Stream(copy id))
+    }
+
+    /// Appends exactly one new chunk at `sequence` and advances the stream
+    /// cursor atomically. A duplicate/out-of-order append is refused, which
+    /// makes retrying after reconnect safe without double-appending text.
+    function appendStream(
+        borrow mut self,
+        id: borrow String,
+        sequence: Number,
+        content: borrow String
+    ) -> Result<Void, StreamFailure> {
+        if content.count == 0 { return .Error(.EmptyChunk) }
+        let head = try streamHeadFor(id)
+        let state = try streamHeadState(head)
+        match state {
+            Open -> {}
+            Completed -> return .Error(.NotOpen(copy id))
+            Failed(_) -> return .Error(.NotOpen(copy id))
+        }
+        let next = try streamNext(head)
+        if sequence != next { return .Error(.WrongSequence(next)) }
+        var chunk = Document()
+        chunk.set("content", .Text(copy content))
+        var changes = Changes()
+        let chunkKey = try streamChunkKey(id, sequence)
+        try changes.put(streamChunks(), chunkKey, chunk)
+        try changes.put(streamMetadata(), .Text(copy id), streamHead(next + 1, .Open))
+        try apply(changes)
+        return .Ok
+    }
+
+    /// Finishes the stream. Its chunks remain readable and unchanged.
+    function finishStream(borrow mut self, id: borrow String) -> Result<Void, StreamFailure> {
+        return terminateStream(id, .Completed)
+    }
+
+    /// Persists a generation failure without discarding the already stored
+    /// partial answer. The UI may show it and offer a retry as a new stream.
+    function failStream(borrow mut self, id: borrow String, reason: String) -> Result<Void, StreamFailure> {
+        return terminateStream(id, .Failed(reason))
+    }
+
+    function terminateStream(
+        borrow mut self,
+        id: borrow String,
+        state: StreamState
+    ) -> Result<Void, StreamFailure> {
+        let head = try streamHeadFor(id)
+        let oldState = try streamHeadState(head)
+        match oldState {
+            Open -> {}
+            Completed -> return .Error(.NotOpen(copy id))
+            Failed(_) -> return .Error(.NotOpen(copy id))
+        }
+        let next = try streamNext(head)
+        try put(streamMetadata(), .Text(copy id), streamHead(next, state))
+        return .Ok
+    }
+
+    /// Reads the full saved content; useful when opening the chat offline.
+    function readStream(borrow self, id: borrow String) -> Result<StreamSnapshot, StreamFailure> {
+        let slice = try readStreamSince(id, 0)
+        return .Ok(StreamSnapshot {
+            id: copy slice.id,
+            content: slice.content,
+            nextChunk: slice.nextChunk,
+            state: slice.state
+        })
+    }
+
+    /// Reads only chunks at or after `fromChunk`, so a subscriber/appender can
+    /// resume without polling or re-encoding previously materialized text.
+    function readStreamSince(
+        borrow self,
+        id: borrow String,
+        fromChunk: Number
+    ) -> Result<StreamSlice, StreamFailure> {
+        let head = try streamHeadFor(id)
+        let next = try streamNext(head)
+        if fromChunk < 0 || fromChunk > next || fromChunk % 1 != 0 {
+            return .Error(.InvalidCursor(fromChunk))
+        }
+        let state = try streamHeadState(head)
+        var text = ""
+        var parts: [String] = []
+        for index in fromChunk..next {
+            let key = try streamChunkKey(id, index)
+            let chunk = match try get(streamChunks(), key) {
+                Some(found) -> found
+                None -> return .Error(.Corrupt("missing chunk \(index) of \(id)"))
+            }
+            let part = match chunk.textField("content") {
+                Some(found) -> found
+                None -> return .Error(.Corrupt("invalid chunk \(index) of \(id)"))
+            }
+            text = "\(text)\(part)"
+            parts.append(part)
+        }
+        return .Ok(StreamSlice {
+            id: copy id,
+            fromChunk: fromChunk,
+            nextChunk: next,
+            content: text,
+            parts: parts,
+            state: state
+        })
+    }
+
+    function streamHeadFor(borrow self, id: borrow String) -> Result<Document, StreamFailure> {
+        return match try get(streamMetadata(), .Text(copy id)) {
+            Some(head) -> .Ok(head)
+            None -> .Error(.Missing(copy id))
+        }
+    }
+}

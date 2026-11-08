@@ -1,0 +1,27 @@
+//! Catalog namespace isolation for replicas of databases with independent
+//! table histories. The server's table IDs are needed to evaluate remote
+//! subscriptions, but must never replace the device's local table catalog.
+import Foundation
+
+/// All ordinary collection and row keys keep their original on-wire bytes.
+/// Only table catalog metadata is mapped to an independent local keyspace.
+function replicaStoredKey(key: borrow [UN8], separate: Bool) -> [UN8] {
+    if !separate { return copy key }
+    var prefix: [UN8] = []
+    prefix.appendTextKey(TableSpace.catalog)
+    if key.count < prefix.count { return copy key }
+    for i in 0..prefix.count {
+        if key[i] != prefix[i] { return copy key }
+    }
+    var mapped: [UN8] = []
+    mapped.appendTextKey(TableSpace.remoteCatalog)
+    for i in prefix.count..key.count { mapped.append(key[i]) }
+    return mapped
+}
+
+function replicaStoredRange(range: borrow KeyRange, separate: Bool) -> KeyRange {
+    return KeyRange {
+        start: replicaStoredKey(range.start, separate),
+        end: replicaStoredKey(range.end, separate)
+    }
+}

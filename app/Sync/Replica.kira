@@ -29,8 +29,15 @@ struct ClientSubscription {
     let arguments: Value
     /// Whether the replica holds every key the query reads.
     var ready: Bool = false
-    /// The result last reported, as text.
-    var shown: String = ""
+    /// Readiness is independently observable from the query value. A reopened
+    /// replica may already hold the exact server answer and thus have no
+    /// value delta when the server confirms its subscription. Emit one
+    /// Changed event on the first ready transition of each session anyway.
+    var readyReported: Bool = false
+    /// An exact binary representation of the last query outcome. Diagnostic
+    /// `traceText` abbreviates nested values (e.g. a seven-field document as
+    /// `[7 elements]`) and must never be used to decide data equality.
+    var shown: [UN8] = []
 }
 
 /// A mutation sent but not yet answered by the server.
@@ -71,6 +78,14 @@ public struct Replica {
     var outbox: [ClientMessage] = []
     /// Events for the application, since the last `takeEvents`.
     var events: [SyncEvent] = []
+    /// Remote server catalog metadata is stored separately from the device's
+    /// local tables. Their numeric IDs may differ after schema migrations.
+    var separateCatalog: Bool = false
+
+    function isolateTableCatalog(borrow mut self) {
+        separateCatalog = true
+        database.catalogNamespace = TableSpace.remoteCatalog
+    }
 
     /// Subscribes to the query `name` with `arguments`, and answers its number. The query's result becomes ready when the replica holds what it reads.
     function subscribe(borrow mut self, name: String, arguments: Value) -> Number {
@@ -153,6 +168,7 @@ public struct Replica {
         outbox.append(.Hello(Hello { client: caller.client, credentials: credentials }))
         for index in 0..subscriptions.count {
             subscriptions[index].ready = false
+            subscriptions[index].readyReported = false
             let subscription = subscriptions[index]
             outbox.append(
                 .Subscribe(

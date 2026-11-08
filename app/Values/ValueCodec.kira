@@ -25,6 +25,8 @@ enum ValueTag: UN8 {
     List = 6
     /// A document: a count, then each field's name and value.
     Document = 7
+    /// A stable UTF-8 stream id; chunks live separately in the database.
+    Stream = 8
 }
 
 /// Writing values into a byte array.
@@ -52,6 +54,10 @@ extend Array<UN8> {
                 for item in items { appendValue(item) }
             }
             Document(document) -> appendDocument(document)
+            Stream(id) -> {
+                self.append(code(ValueTag.Stream))
+                appendLengthPrefixed(id.utf8())
+            }
         }
     }
 
@@ -118,6 +124,10 @@ extend ByteCursor {
             Bytes -> readBytesValue()
             List -> readList()
             Document -> readDocument()
+            Stream -> {
+                let id = try readText()
+                return .Ok(.Stream(id))
+            }
             else -> .Error(.UnknownTag(start))
         }
     }

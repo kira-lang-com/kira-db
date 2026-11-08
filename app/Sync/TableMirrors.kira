@@ -1,0 +1,34 @@
+//! Replica-side table materialization. Query contents still arrive solely via
+//! KiraDB SyncHost/SyncLink; no external HTTP reads or UI message buffers.
+import Foundation
+
+extend Replica {
+    /// Mirror a subscribed query's list of documents into a named local table
+    /// using that table's own catalog ID. This is especially useful when a
+    /// server table was recreated during a migration, but a replica's table
+    /// was created fresh and therefore received a different numeric ID.
+    function materializeTableQuery(
+        borrow mut self,
+        query: Number,
+        tableName: borrow String,
+        scope: borrow [TableMirrorScope]
+    ) -> Result<Void, TableMirrorFailure> {
+        let value = try result(query)
+        let values = match value {
+            List(items) -> items
+            else -> return .Error(.NotAList)
+        }
+        var rows: [Document] = []
+        for item in values {
+            match item {
+                Document(document) -> rows.append(document)
+                else -> return .Error(.NotADocument)
+            }
+        }
+        var local = database.fork()
+        // The remote query reads the remote catalog; the materialized row
+        // belongs to the device's own named table and numeric table ID.
+        local.catalogNamespace = TableSpace.catalog
+        return local.mirrorTableRows(tableName, scope, rows)
+    }
+}

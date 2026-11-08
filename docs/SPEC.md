@@ -36,6 +36,7 @@ addition:
 | Keys | `app/Keys` | Order-preserving key encoding of values |
 | Storage | `app/Storage` | Log, memory table, sorted tables, manifest, compaction |
 | Documents | `app/Documents` | `Database`, `Collection`: the public document API |
+| Streams | `app/Streams` | Durable append-only content by stable stream ID, cursor and completion state |
 | Tables | `app/Tables` | Schemas, catalog, typed rows, indexes, queries and their plans |
 | Sync | `app/Sync` | Functions, the sync server, replicas, their protocol and its QUIC transport |
 | Replication | `app/Replication` | Groups of servers holding one database of record: log, elections, snapshots |
@@ -53,6 +54,7 @@ enum Value {
     Bytes([UN8])
     List([Value])
     Document(Document)
+    Stream(String)
 }
 ```
 
@@ -74,6 +76,7 @@ unsigned variable-length number (section 3.2).
 | 5 | `Bytes` | length, then bytes |
 | 6 | `List` | count, then each value |
 | 7 | `Document` | count, then each field: name as length and UTF-8 bytes, then the value |
+| 8 | `Stream` | stable stream ID: length, then UTF-8 bytes. Content is stored separately. |
 
 ### 3.2 Variable-length numbers
 
@@ -110,7 +113,65 @@ Escaping writes byte 0 as `0, 255`; the terminator is `0, 1`. A tuple of
 values encodes as the concatenation of their keys, so a tuple orders by its
 first value, then its second.
 
-`Document` and `List` values cannot be keys.
+`Document`, `List` and `Stream` values cannot be keys. A table column may have
+type `Stream`, but such a column cannot be indexed or used as a primary key.
+
+### 4.1 Durable streams
+
+A `Value.Stream(id)` is an immutable reference, not a string or a network
+session. Its content lives in the database's `__kira_streams` metadata
+collection and `__kira_stream_chunks` content collection. Chunks are keyed by
+an order-preserving encoded `(id, sequence)` tuple, starting at index zero.
+The metadata record contains the next expected index and one of `Open`,
+`Completed`, `Failed(reason)`. Every append atomically writes exactly one new
+chunk and advances that cursor. Failed batches do not acknowledge content;
+duplicate, out-of-order or empty chunks are refused. Completion and failure
+are permanent states; previously stored partial content remains readable.
+
+`beginStream(id)` creates the metadata. `appendStream(id, sequence, content)`
+does not alter the stream ID or any existing chunk. `readStream(id)` returns
+its complete materialization, and `readStreamSince(id, cursor)` returns the
+exact ordered chunks from that index plus their concatenation, next cursor
+and terminal state. A client may resume at the next cursor after reconnecting
+without duplicating any text. All data persists through database reopening.
+
+### 4.2 Server-generated subscription transitions
+
+`SyncServer.streamChange` commits a server-owned begin/append/complete/fail
+operation to its database and broadcasts its committed writes through the
+same subscription transition protocol used for client mutations. There is
+no transient network-generated text in a replica's view. A subscription
+that read the stream cursor/chunks is invalidated and re-executed; its client
+receives the changed KiraDB keys and reconstructs the same stream locally.
+This is independent of the application-level producer (for example, an AI
+model), which need only write append-only chunks into KiraDB.
+
+### 4.3 Named-table synchronization across independent catalogs
+
+Table IDs are *database-local numeric allocations*. A table recreated during
+a schema migration receives another ID even if its name and primary key stay
+unchanged. KiraDB's remote subscription engine must not replace the device's
+catalog when that same database also holds local-only rows.
+
+`Replica.isolateTableCatalog()` opts into two catalog keyspaces on a shared
+database: the device's normal `c` table catalog remains untouched, and the
+server's `c` keys are translated to `sync-remote-catalog` as KiraDB transitions
+are applied. Incoming row and stream keys retain their server identities,
+allowing subscribed queries to evaluate using the server's catalog. The
+application's `ChatStore`-style named tables still resolve against the local
+catalog. Translated held and released ranges are cleared only in the remote
+catalog keyspace; stale subscriptions cannot erase local table definitions.
+
+To materialize a subscription's `List(Document)` rows in a named local table,
+call `Replica.materializeTableQuery(query, tableName, scope)` after that query
+is ready. `scope` is a list of equality conditions (`TableMirrorScope`) that
+defines exactly the server-owned partition, such as `(origin = cloud,
+chat = 7)`. KiraDB validates the whole source set, strips computed fields not
+declared in the local schema, rejects duplicate keys and out-of-scope rows,
+then reconciles additions, edits and deletions into the local table in **one
+recorded transaction**. Other partitions, particularly local-origin rows,
+remain untouched. The client views the materialized table through its own
+catalog ID without depending on a matching server allocation history.
 
 ## 5. Storage
 

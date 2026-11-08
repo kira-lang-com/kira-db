@@ -10,6 +10,8 @@ import Foundation
 namespace TableSpace {
     /// The space that holds the catalog and the next table id.
     let catalog: String = "c"
+    /// A separate catalog for a remote server's table IDs on a replica.
+    let remoteCatalog: String = "sync-remote-catalog"
     /// The key of the next table id to hand out.
     let nextId: String = "next-id"
     /// The name a catalog entry for a table is stored under.
@@ -30,16 +32,24 @@ function pastPrefix(prefix: borrow [UN8]) -> [UN8] {
 
 /// Returns the key of the next table id.
 function nextIdKey() -> [UN8] {
+    return nextIdKeyIn(TableSpace.catalog)
+}
+
+function nextIdKeyIn(space: borrow String) -> [UN8] {
     var key: [UN8] = []
-    key.appendTextKey(TableSpace.catalog)
+    key.appendTextKey(space)
     key.appendTextKey(TableSpace.nextId)
     return key
 }
 
 /// Returns the catalog key of the table called `name`.
 function catalogKey(name: borrow String) -> [UN8] {
+    return catalogKeyIn(TableSpace.catalog, name)
+}
+
+function catalogKeyIn(space: borrow String, name: borrow String) -> [UN8] {
     var key: [UN8] = []
-    key.appendTextKey(TableSpace.catalog)
+    key.appendTextKey(space)
     key.appendTextKey(TableSpace.table)
     key.appendTextKey(name)
     return key

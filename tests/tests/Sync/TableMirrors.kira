@@ -1,0 +1,207 @@
+//! Subscriptions between databases with different table catalog histories.
+//! Remote table keys and metadata stay in their own catalog; locally materialized
+//! rows use the device's independent table ID and preserve local-only rows.
+import Foundation
+import KiraDB
+
+function mirroredChatSchema() -> TableSchema {
+    return TableSchema {
+        name: "messages",
+        columns: [
+            Column { name: "origin", type: .Text },
+            Column { name: "chat", type: .Number },
+            Column { name: "index", type: .Number },
+            Column { name: "text", type: .Text }
+        ],
+        primaryKey: ["origin", "chat", "index"]
+    }
+}
+
+function mirrorMessage(origin: String, chat: Number, index: Number, text: String) -> Document {
+    var row = Document()
+    row.set("origin", .Text(move origin))
+    row.set("chat", .Number(chat))
+    row.set("index", .Number(index))
+    row.set("text", .Text(move text))
+    return row
+}
+
+function mirroredChatRows(
+    database: borrow Database,
+    caller: borrow Caller,
+    args: borrow Value
+) -> Result<Value, FunctionFailure> {
+    let table = try database.table("messages")
+    let rows = try database.select(table.query()
+        .filter(column("origin").equals(.Text("cloud")))
+        .filter(column("chat").equals(.Number(7))))
+    var values: [Value] = []
+    for row in rows {
+        var display = copy row
+        display.set("__computed", .Text("query-only metadata"))
+        values.append(.Document(display))
+    }
+    return .Ok(.List(values))
+}
+
+function mirroredChatFunctions() -> Functions {
+    return Functions {
+        queries: [QueryFunction {
+            name: "cloud-chat-7",
+            run: { database, caller, args in return mirroredChatRows(database, caller, args) }
+        }],
+        mutations: []
+    }
+}
+
+function mirrorScope() -> [TableMirrorScope] {
+    return [
+        TableMirrorScope { column: "origin", value: .Text("cloud") },
+        TableMirrorScope { column: "chat", value: .Number(7) }
+    ]
+}
+
+@Test
+function remoteRecreatedTableMirrorsIntoLocalTableWithoutChangingLocalCatalog() {
+    let remoteDir = match emptyDirectory("remote-catalog-recreated-table") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    let localDir = match emptyDirectory("local-catalog-fresh-table") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    var remote = match openDatabase(remoteDir) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    // Simulate an older server whose messages table was dropped/recreated
+    // for an additive column: its table ID is not the device's table ID.
+    let earlier = match remote.createTable(mirroredChatSchema()) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    absorb remote.dropTable(earlier)
+    let serverTable = match remote.createTable(mirroredChatSchema()) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    absorb remote.insert(serverTable, mirrorMessage("cloud", 7, 0, "server answer"))
+    var local = match openDatabase(localDir) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    let localTable = match local.createTable(mirroredChatSchema()) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    expect!(serverTable.id != localTable.id)
+    absorb local.insert(localTable, mirrorMessage("local", 7, 0, "offline-owned"))
+    let server = syncServerOnDatabase(remote.fork(), mirroredChatFunctions(), anyone)
+    var replica = match replicaOnDatabase(local.fork(), mirroredChatFunctions()) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    replica.isolateTableCatalog()
+    var rig = SyncRig { server: server, replicas: [replica], sessions: [0] }
+    rig.connect(0, .Text("device"))
+    let query = rig.replicas[0].subscribe("cloud-chat-7", .Null)
+    absorb rig.pump()
+    expect!(rig.replicas[0].ready(query))
+    // The subscription query reads the server's rebuilt table ID, while the
+    // application's ordinary DB table remains its original local table ID.
+    let remoteCatalogTable = match rig.replicas[0].database.table("messages") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    expect!(remoteCatalogTable.id == serverTable.id)
+    let stillLocal = match local.table("messages") {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    expect!(stillLocal.id == localTable.id)
+    match rig.replicas[0].materializeTableQuery(query, "messages", mirrorScope()) {
+        Ok -> {}
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    let rows = match local.select(localTable.query()) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    expect!(rows.count == 2)
+    // Never copy computed query fields into the table, and never overwrite an
+    // offline-owned row just because the remote table carries another ID.
+    let cloud = match local.row(localTable, [.Text("cloud"), .Number(7), .Number(0)]) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    match cloud {
+        Some(value) -> {
+            match value.textField("text") {
+                Some(text) -> expect!(text == "server answer")
+                None -> expect!(false)
+            }
+            expect!(value.field("__computed").isNone())
+        }
+        None -> expect!(false)
+    }
+    let offline = match local.row(localTable, [.Text("local"), .Number(7), .Number(0)]) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    match offline {
+        Some(value) -> match value.textField("text") {
+            Some(text) -> expect!(text == "offline-owned")
+            None -> expect!(false)
+        }
+        None -> expect!(false)
+    }
+    // A source document outside the declared partition is rejected before
+    // any row or index changes. No partial synchronization is permitted.
+    let invalid = local.mirrorTableRows("messages", mirrorScope(), [
+        mirrorMessage("cloud", 7, 0, "would overwrite"),
+        mirrorMessage("local", 7, 1, "must refuse")
+    ])
+    expect!(traceText(invalid).contains("OutsideScope"))
+    let preserved = match local.row(localTable, [.Text("cloud"), .Number(7), .Number(0)]) {
+        Ok(value) -> value
+        Error(problem) -> { expect!(traceText(problem) == "")
+            return
+        }
+    }
+    match preserved {
+        Some(value) -> match value.textField("text") {
+            Some(text) -> expect!(text == "server answer")
+            None -> expect!(false)
+        }
+        None -> expect!(false)
+    }
+}

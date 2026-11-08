@@ -93,6 +93,7 @@ extend Array<UN8> {
             }
             List(_) -> return .Error(.Unordered)
             Document(_) -> return .Error(.Unordered)
+            Stream(_) -> return .Error(.Unordered)
         }
         return .Ok
     }

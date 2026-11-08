@@ -103,7 +103,10 @@ function unsubscribeReleasesItsKeys() {
             return
         }
     }
-    expect!((parts[0]) == "2")
+    // Local optimistic value, confirmed subscription readiness, then the
+    // committed server value: readiness is observable even if cached values
+    // were already equal when the server confirmed its held key ranges.
+    expect!((parts[0]) == "3")
     expect!((parts[1]) == "1")
     expect!((parts[2]) == "0")
     expect!((parts[3]) == "0")

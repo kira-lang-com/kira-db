@@ -59,6 +59,7 @@ function changeOf(document: borrow Document) -> Result<Change, MessageFailure> {
             Text(_) -> .Error(.Malformed)
             List(_) -> .Error(.Malformed)
             Document(_) -> .Error(.Malformed)
+            Stream(_) -> .Error(.Malformed)
         }
     }
     if kind == "hold" {
@@ -182,6 +183,7 @@ function bytesOf(document: borrow Document, name: borrow String) -> Result<[UN8]
         Text(_) -> .Error(.Malformed)
         List(_) -> .Error(.Malformed)
         Document(_) -> .Error(.Malformed)
+        Stream(_) -> .Error(.Malformed)
     }
 }
 

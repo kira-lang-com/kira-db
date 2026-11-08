@@ -1,0 +1,76 @@
+//! A sync server's background writer. The server that generates a stream owns
+//! its content; subscribers receive ordinary KiraDB transitions for new chunks
+//! and completion, not an extra per-token message protocol.
+import Foundation
+
+/// A server-owned stream operation, such as an AI generator's next chunk.
+public enum ServerStreamChange {
+    Begin(String)
+    Append(StreamAppend)
+    Complete(String)
+    Fail(StreamFail)
+}
+
+/// A server appender's stable id, expected next chunk and new content.
+public struct StreamAppend {
+    let id: String
+    let sequence: Number
+    let content: String
+}
+
+/// A failed stream retains its content and records the failure reason.
+public struct StreamFail {
+    let id: String
+    let reason: String
+}
+
+/// The stream was rejected, or the update could not be committed/broadcast.
+public enum ServerStreamFailure {
+    Stream(StreamFailure)
+    Sync(SyncFailure)
+}
+
+extend ServerStreamFailure {
+    function from(problem: StreamFailure) -> ServerStreamFailure { return .Stream(problem) }
+    function from(problem: SyncFailure) -> ServerStreamFailure { return .Sync(problem) }
+    function from(problem: StorageFailure) -> ServerStreamFailure {
+        return .Sync(.Database(.Storage(problem)))
+    }
+}
+
+extend SyncServer {
+    /// Commits one chunk and its cursor (or a terminal state) atomically,
+    /// then broadcasts its database writes to subscribers. No network text
+    /// delta or client-originated mutation is required for model generation.
+    /// On a rejected stream update the recorded writes are discarded: no
+    /// optimistic partial content can escape into the server's database.
+    function streamChange(
+        borrow mut self,
+        change: borrow ServerStreamChange
+    ) -> Result<Value, ServerStreamFailure> {
+        database.beginRecording()
+        let outcome: Result<Value, StreamFailure> = match change {
+            Begin(id) -> database.beginStream(id)
+            Append(part) -> match database.appendStream(part.id, part.sequence, part.content) {
+                Ok -> .Ok(.Stream(copy part.id))
+                Error(problem) -> .Error(problem)
+            }
+            Complete(id) -> match database.finishStream(id) {
+                Ok -> .Ok(.Stream(copy id))
+                Error(problem) -> .Error(problem)
+            }
+            Fail(failed) -> match database.failStream(failed.id, copy failed.reason) {
+                Ok -> .Ok(.Stream(copy failed.id))
+                Error(problem) -> .Error(problem)
+            }
+        }
+        let run = database.endRecording()
+        let value = match outcome {
+            Ok(value) -> value
+            Error(problem) -> return .Error(.Stream(problem))
+        }
+        try database.writeBatch(run.batch)
+        try announceServerWrites(run.batch.writes)
+        return .Ok(value)
+    }
+}

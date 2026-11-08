@@ -76,6 +76,27 @@ public struct Database {
     var store: Store
     /// The run of writes being recorded instead of written, or `.None` when none is being recorded.
     var recording: Recording?
+    /// The catalog this database view uses for named tables. The local
+    /// application uses `c`; an opt-in sync replica may use a separate catalog
+    /// for the server's table IDs without overwriting local-only rows.
+    var catalogNamespace: String = "c"
+
+    /// A separate database view of the same open storage engine. Each view
+    /// has its own query/optimistic-mutation recording context and therefore
+    /// cannot accidentally capture another view's writes. The original store
+    /// remains the sole owner of closing its files.
+    function fork(borrow self) -> Database {
+        return Database {
+            store: copy store, recording: .None,
+            catalogNamespace: copy catalogNamespace
+        }
+    }
+
+    /// Observe committed write batches from every view of this store. The
+    /// observer is reference-owned; callers may drain it after a network turn.
+    function observeWrites(borrow mut self) -> StoreWriteObserver {
+        return store.observe()
+    }
 
     /// Stores `document` under `key` in `collection`, replacing any document there. The write survives a crash once this returns.
     ///
