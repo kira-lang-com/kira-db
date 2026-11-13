@@ -598,9 +598,16 @@ that fails holds no writes. A query's result is its run over the view.
 While a session is open, `subscribe`, `unsubscribe` and `mutate` also send
 their messages.
 
-When a session opens, the replica's held set becomes its stale set and its
+When a session opens, the replica's held set joins its stale set and its
 held set is empty: the server holds nothing for a new session. A `hold` adds
 its range to the held set and a `release` removes its range.
+
+A replica opens with a retention: `Exact` (the default) or `KeepReleased`.
+Under `Exact` a `release` removes its range's keys, as the table above says.
+Under `KeepReleased` it keeps them and adds the range to the stale set, so
+queries still read released rows offline and before they are ready; a later
+`hold` of the range replaces them with the server's pairs. The cache is never
+trimmed.
 
 On `welcome`, a replica that had no client id stores the one given, and it
 stores the identity. The view runs as the caller of the stored client id and
@@ -609,7 +616,8 @@ identity: 0 and `Null` before the first `welcome`. On a
 union of its held and stale sets as `held`, and the removal of every pending
 mutation numbered up to `applied`. Once every subscription is ready, the
 same batch also removes the keys of the stale ranges outside the held set,
-and the stale set becomes empty. Then the replica runs its remaining pending
+and the stale set becomes empty; under `KeepReleased` it removes nothing and
+the stale set becomes its ranges outside the held set. Then the replica runs its remaining pending
 mutations again to rebuild the view.
 
 A replica's subscriptions last for one open replica; queries are subscribed
@@ -617,7 +625,10 @@ again when it is opened again.
 
 The replica reports events: `Welcomed(identity)`, `Refused(reason)`,
 `Changed(query)` when a query's result over the view differs from the one
-last reported, and `Done(number, outcome)` when a mutation's result arrives.
+last reported, `Done(number, outcome)` when a mutation's result arrives, and
+`Ready(query)` when a transition's `ready` first lists the query. Local calls
+(`subscribe`, `unsubscribe`, `mutate`) report their `Changed` events at once,
+not with the next transition.
 
 ### 8.6 Transport
 
